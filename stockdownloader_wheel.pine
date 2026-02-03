@@ -477,27 +477,23 @@ bgcolor(not activeCSP and not activeCC and showBgTint ? volBarColor : na,
 // ALERTS
 // ---------------------------------------------------------------------------
 
+// alertcondition requires const string for message -- use static text with
+// TradingView placeholders.  For dynamic values, check the on-chart dashboard.
+
 alertcondition(activeCSP, title="Sell CSP Signal",
-     message="WHEEL: Sell Cash-Secured Put signal on {{ticker}} | Score: " +
-             str.tostring(cspPct, "#.0") + " | Quality: " + cspQuality +
-             " | Suggested Strike: " + str.tostring(cspStrikeLevel, "#.##"))
+     message="WHEEL: Cash-Secured Put sell signal on {{ticker}}. Check dashboard for score and strike guidance.")
 
 alertcondition(activeCC, title="Sell CC Signal",
-     message="WHEEL: Sell Covered Call signal on {{ticker}} | Score: " +
-             str.tostring(ccPct, "#.0") + " | Quality: " + ccQuality +
-             " | Suggested Strike: " + str.tostring(ccStrikeLevel, "#.##"))
+     message="WHEEL: Covered Call sell signal on {{ticker}}. Check dashboard for score and strike guidance.")
 
 alertcondition(cspStrongSignal and showCSP, title="Strong CSP Signal",
-     message="WHEEL: STRONG Sell CSP signal on {{ticker}} | Score: " +
-             str.tostring(cspPct, "#.0"))
+     message="WHEEL: STRONG Cash-Secured Put signal on {{ticker}}.")
 
 alertcondition(ccStrongSignal and showCC, title="Strong CC Signal",
-     message="WHEEL: STRONG Sell CC signal on {{ticker}} | Score: " +
-             str.tostring(ccPct, "#.0"))
+     message="WHEEL: STRONG Covered Call signal on {{ticker}}.")
 
 alertcondition(hvIsVeryHigh, title="Very High Volatility",
-     message="WHEEL: Very high volatility on {{ticker}} (HV Rank: " +
-             str.tostring(hvRank, "#.0") + "%) -- ideal for premium selling")
+     message="WHEEL: Very high volatility on {{ticker}} -- ideal for premium selling.")
 
 // ---------------------------------------------------------------------------
 // DASHBOARD TABLE
