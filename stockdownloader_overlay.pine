@@ -1,0 +1,116 @@
+// This Pine Script source code is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+//
+// Stock Downloader Overlay
+//
+// Visual indicators overlay for use alongside the StockDownloader Strategy.
+// Displays moving averages, Bollinger Bands, Ichimoku Cloud, Parabolic SAR,
+// and dynamic support/resistance levels.
+//
+// Use with companion scripts:
+//   - stockdownloader_strategy.pine  (trading strategy)
+//   - stockdownloader_dashboard.pine (confluence scanner)
+
+//@version=6
+indicator("StockDownloader Overlay", overlay=true,
+     max_lines_count=500, max_labels_count=500)
+
+// ---------------------------------------------------------------------------
+// INPUTS
+// ---------------------------------------------------------------------------
+
+string MA_GROUP  = "Moving Averages"
+string BB_GROUP  = "Bollinger Bands"
+string ICH_GROUP = "Ichimoku Cloud"
+string SAR_GROUP = "Parabolic SAR"
+string SR_GROUP  = "Support / Resistance"
+
+// Toggles
+showSMA50    = input.bool(true, "Show SMA 50", group=MA_GROUP)
+showSMA200   = input.bool(true, "Show SMA 200", group=MA_GROUP)
+showEMA12    = input.bool(false, "Show EMA 12", group=MA_GROUP)
+showEMA26    = input.bool(false, "Show EMA 26", group=MA_GROUP)
+showEMA200   = input.bool(false, "Show EMA 200", group=MA_GROUP)
+
+showBB       = input.bool(true, "Show Bollinger Bands", group=BB_GROUP)
+bbPeriod     = input.int(20, "BB Period", minval=1, group=BB_GROUP)
+bbMult       = input.float(2.0, "BB Std Dev Multiplier", minval=0.1, step=0.1, group=BB_GROUP)
+
+showIchimoku = input.bool(false, "Show Ichimoku Cloud", group=ICH_GROUP)
+showSAR      = input.bool(false, "Show Parabolic SAR", group=SAR_GROUP)
+
+showSR       = input.bool(true, "Show Support/Resistance", group=SR_GROUP)
+swingLen     = input.int(5, "Swing Pivot Length", minval=2, maxval=20, group=SR_GROUP)
+
+// ---------------------------------------------------------------------------
+// MOVING AVERAGES
+// ---------------------------------------------------------------------------
+
+sma50  = ta.sma(close, 50)
+sma200 = ta.sma(close, 200)
+ema12  = ta.ema(close, 12)
+ema26  = ta.ema(close, 26)
+ema200 = ta.ema(close, 200)
+
+plot(showSMA50  ? sma50  : na, "SMA 50",  color=color.new(color.blue, 30), linewidth=1)
+plot(showSMA200 ? sma200 : na, "SMA 200", color=color.new(color.red, 30),  linewidth=1)
+plot(showEMA12  ? ema12  : na, "EMA 12",  color=color.new(color.teal, 40), linewidth=1)
+plot(showEMA26  ? ema26  : na, "EMA 26",  color=color.new(color.orange, 40), linewidth=1)
+plot(showEMA200 ? ema200 : na, "EMA 200", color=color.new(color.purple, 40), linewidth=1)
+
+// ---------------------------------------------------------------------------
+// BOLLINGER BANDS
+// ---------------------------------------------------------------------------
+
+bbBasis = ta.sma(close, bbPeriod)
+bbDev   = ta.stdev(close, bbPeriod) * bbMult
+bbUpper = bbBasis + bbDev
+bbLower = bbBasis - bbDev
+
+pBBU = plot(showBB ? bbUpper : na, "BB Upper", color=color.new(color.gray, 50), linewidth=1)
+plot(showBB ? bbBasis : na, "BB Middle", color=color.new(color.gray, 65), linewidth=1, style=plot.style_circles)
+pBBL = plot(showBB ? bbLower : na, "BB Lower", color=color.new(color.gray, 50), linewidth=1)
+fill(pBBU, pBBL, color=showBB ? color.new(color.gray, 92) : na, title="BB Fill")
+
+// ---------------------------------------------------------------------------
+// ICHIMOKU CLOUD
+// ---------------------------------------------------------------------------
+
+tenkan = (ta.highest(high, 9) + ta.lowest(low, 9)) / 2
+kijun  = (ta.highest(high, 26) + ta.lowest(low, 26)) / 2
+spanA  = (tenkan + kijun) / 2
+spanB  = (ta.highest(high, 52) + ta.lowest(low, 52)) / 2
+
+pSpanA = plot(showIchimoku ? spanA : na, "Span A", color=color.new(color.green, 70), offset=26)
+pSpanB = plot(showIchimoku ? spanB : na, "Span B", color=color.new(color.red, 70), offset=26)
+fill(pSpanA, pSpanB,
+     color=showIchimoku ? (spanA >= spanB ? color.new(color.green, 90) : color.new(color.red, 90)) : na,
+     title="Ichimoku Cloud")
+plot(showIchimoku ? tenkan : na, "Tenkan", color=color.new(color.blue, 50), linewidth=1)
+plot(showIchimoku ? kijun : na, "Kijun", color=color.new(color.maroon, 50), linewidth=1)
+
+// ---------------------------------------------------------------------------
+// PARABOLIC SAR
+// ---------------------------------------------------------------------------
+
+sarVal     = ta.sar(0.02, 0.02, 0.2)
+sarBullish = close > sarVal
+
+plot(showSAR ? sarVal : na, "Parabolic SAR",
+     color=sarBullish ? color.new(color.green, 30) : color.new(color.red, 30),
+     style=plot.style_circles, linewidth=1)
+
+// ---------------------------------------------------------------------------
+// SUPPORT & RESISTANCE (Swing Pivots)
+// ---------------------------------------------------------------------------
+
+swingHigh = ta.pivothigh(high, swingLen, swingLen)
+swingLow  = ta.pivotlow(low, swingLen, swingLen)
+
+if showSR and not na(swingHigh)
+    line.new(bar_index - swingLen, swingHigh, bar_index, swingHigh,
+         color=color.new(color.red, 50), style=line.style_dotted, width=1, extend=extend.right)
+
+if showSR and not na(swingLow)
+    line.new(bar_index - swingLen, swingLow, bar_index, swingLow,
+         color=color.new(color.green, 50), style=line.style_dotted, width=1, extend=extend.right)

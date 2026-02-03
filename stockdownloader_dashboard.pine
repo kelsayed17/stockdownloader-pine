@@ -1,0 +1,345 @@
+// This Pine Script source code is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+//
+// Stock Downloader Dashboard
+//
+// Confluence signal scanner and dashboard table. Scores indicators across
+// trend, momentum, volume, and volatility categories to produce
+// STRONG_BUY / BUY / NEUTRAL / SELL / STRONG_SELL signals.
+//
+// Use with companion scripts:
+//   - stockdownloader_strategy.pine (trading strategy)
+//   - stockdownloader_overlay.pine  (visual indicators)
+
+//@version=6
+indicator("StockDownloader Dashboard", overlay=true)
+
+// ---------------------------------------------------------------------------
+// INPUTS
+// ---------------------------------------------------------------------------
+
+string VIS_GROUP = "Display Settings"
+showDashboard = input.bool(true, "Show Confluence Dashboard", group=VIS_GROUP)
+showBgTint    = input.bool(true, "Show Background Tint", group=VIS_GROUP)
+
+// ---------------------------------------------------------------------------
+// TECHNICAL INDICATORS (for scoring)
+// ---------------------------------------------------------------------------
+
+// Moving Averages
+sma50  = ta.sma(close, 50)
+sma200 = ta.sma(close, 200)
+ema12  = ta.ema(close, 12)
+ema26  = ta.ema(close, 26)
+
+// RSI
+rsiVal  = ta.rsi(close, 14)
+prevRSI = rsiVal[1]
+
+// MACD
+[macdLine, macdSig, macdHist] = ta.macd(close, 12, 26, 9)
+
+// Bollinger Bands
+bbBasis = ta.sma(close, 20)
+bbDev   = ta.stdev(close, 20) * 2.0
+bbUpper = bbBasis + bbDev
+bbLower = bbBasis - bbDev
+bbWidth = bbBasis != 0 ? (bbUpper - bbLower) / bbBasis : 0
+bbPctB  = (bbUpper - bbLower) != 0 ? (close - bbLower) / (bbUpper - bbLower) : 0.5
+
+// Squeeze detection
+bbWidthMin = ta.lowest(bbWidth, 120)
+isSqueeze  = bbWidth <= bbWidthMin * 1.10
+
+// Stochastic
+stochK_raw = ta.stoch(close, high, low, 14)
+stochK     = ta.sma(stochK_raw, 3)
+stochD     = ta.sma(stochK, 3)
+
+// Williams %R
+williamsR = -100 * (ta.highest(high, 14) - close) / (ta.highest(high, 14) - ta.lowest(low, 14))
+
+// CCI
+cciVal = ta.cci(close, 20)
+
+// ROC
+rocVal = ta.roc(close, 12)
+
+// ADX / DI
+[diPlus, diMinus, adxVal] = ta.dmi(14, 14)
+
+// ATR
+atrVal = ta.atr(14)
+
+// OBV
+obvVal    = ta.obv
+obvSmaF   = ta.sma(obvVal, 5)
+obvRising = obvSmaF > obvSmaF[1]
+
+// MFI
+mfiVal = ta.mfi(hlc3, 14)
+
+// VWAP
+vwapVal = ta.vwap(hlc3)
+
+// Volume Average
+avgVol20 = ta.sma(volume, 20)
+
+// Parabolic SAR
+sarVal     = ta.sar(0.02, 0.02, 0.2)
+sarBullish = close > sarVal
+
+// Ichimoku
+tenkan = (ta.highest(high, 9) + ta.lowest(low, 9)) / 2
+kijun  = (ta.highest(high, 26) + ta.lowest(low, 26)) / 2
+spanA  = (tenkan + kijun) / 2
+spanB  = (ta.highest(high, 52) + ta.lowest(low, 52)) / 2
+priceAboveCloud = close > math.max(spanA, spanB)
+
+// ---------------------------------------------------------------------------
+// CONFLUENCE SCORING
+// ---------------------------------------------------------------------------
+
+bullishCount = 0
+bearishCount = 0
+
+// --- TREND ---
+// EMA(12) vs EMA(26)
+bullishCount += ema12 > ema26 ? 1 : 0
+bearishCount += ema12 < ema26 ? 1 : 0
+
+// Price vs SMA(200)
+if sma200 > 0
+    bullishCount += close > sma200 ? 1 : 0
+    bearishCount += close < sma200 ? 1 : 0
+
+// Golden / Death Cross
+bullishCount += (sma50 > sma200 and sma50[1] <= sma200[1]) ? 1 : 0
+bearishCount += (sma50 < sma200 and sma50[1] >= sma200[1]) ? 1 : 0
+
+// Ichimoku Cloud
+if spanA > 0
+    bullishCount += priceAboveCloud ? 1 : 0
+    bearishCount += not priceAboveCloud ? 1 : 0
+
+// Ichimoku TK Cross
+bullishCount += (tenkan > kijun and tenkan[1] <= kijun[1]) ? 1 : 0
+bearishCount += (tenkan < kijun and tenkan[1] >= kijun[1]) ? 1 : 0
+
+// Parabolic SAR flip
+bullishCount += (sarBullish and not sarBullish[1]) ? 1 : 0
+bearishCount += (not sarBullish and sarBullish[1]) ? 1 : 0
+
+// ADX trend strength with DI direction
+if adxVal > 25
+    bullishCount += diPlus > diMinus ? 1 : 0
+    bearishCount += diMinus > diPlus ? 1 : 0
+
+// --- MOMENTUM ---
+// RSI
+bullishCount += (rsiVal > 30 and prevRSI <= 30) ? 1 : 0
+bearishCount += (rsiVal < 70 and prevRSI >= 70) ? 1 : 0
+bullishCount += rsiVal < 30 ? 1 : 0
+bearishCount += rsiVal > 70 ? 1 : 0
+
+// MACD crossover
+bullishCount += (macdLine > macdSig and macdLine[1] <= macdSig[1]) ? 1 : 0
+bearishCount += (macdLine < macdSig and macdLine[1] >= macdSig[1]) ? 1 : 0
+
+// MACD histogram expanding
+bullishCount += (macdHist > 0 and macdHist > macdHist[1]) ? 1 : 0
+bearishCount += (macdHist < 0 and macdHist < macdHist[1]) ? 1 : 0
+
+// Stochastic
+bullishCount += stochK < 20 ? 1 : 0
+bearishCount += stochK > 80 ? 1 : 0
+
+// Williams %R
+bullishCount += williamsR < -80 ? 1 : 0
+bearishCount += williamsR > -20 ? 1 : 0
+
+// CCI
+bullishCount += cciVal < -100 ? 1 : 0
+bearishCount += cciVal > 100 ? 1 : 0
+
+// ROC
+bullishCount += (rocVal > 0 and rocVal[1] <= 0) ? 1 : 0
+bearishCount += (rocVal < 0 and rocVal[1] >= 0) ? 1 : 0
+
+// --- VOLUME ---
+// OBV
+bullishCount += obvRising ? 1 : 0
+bearishCount += not obvRising ? 1 : 0
+
+// MFI
+bullishCount += mfiVal < 20 ? 1 : 0
+bearishCount += mfiVal > 80 ? 1 : 0
+
+// Volume vs average
+if avgVol20 > 0 and volume > avgVol20 * 1.5
+    bullishCount += close > close[1] ? 1 : 0
+    bearishCount += close < close[1] ? 1 : 0
+
+// --- VOLATILITY ---
+// Bollinger %B
+bullishCount += bbPctB <= 0 ? 1 : 0
+bearishCount += bbPctB >= 1 ? 1 : 0
+
+// Price vs VWAP
+if vwapVal > 0
+    bullishCount += close > vwapVal ? 1 : 0
+    bearishCount += close < vwapVal ? 1 : 0
+
+// ---------------------------------------------------------------------------
+// SIGNAL CLASSIFICATION
+// ---------------------------------------------------------------------------
+
+totalIndicators = math.max(bullishCount + bearishCount, 1)
+bullishPct = bullishCount / totalIndicators
+bearishPct = bearishCount / totalIndicators
+
+string signalDir = "NEUTRAL"
+float  confluenceScore = 0.0
+
+if bullishPct >= 0.75
+    signalDir := "STRONG BUY"
+    confluenceScore := bullishPct
+else if bullishPct >= 0.55
+    signalDir := "BUY"
+    confluenceScore := bullishPct
+else if bearishPct >= 0.75
+    signalDir := "STRONG SELL"
+    confluenceScore := bearishPct
+else if bearishPct >= 0.55
+    signalDir := "SELL"
+    confluenceScore := bearishPct
+else
+    signalDir := "NEUTRAL"
+    confluenceScore := math.max(bullishPct, bearishPct)
+
+// ---------------------------------------------------------------------------
+// BACKGROUND TINT
+// ---------------------------------------------------------------------------
+
+bgColor = signalDir == "STRONG BUY"  ? color.new(color.green, 90) :
+          signalDir == "BUY"          ? color.new(color.green, 95) :
+          signalDir == "STRONG SELL"  ? color.new(color.red, 90) :
+          signalDir == "SELL"         ? color.new(color.red, 95) :
+          color.new(color.gray, 98)
+bgcolor(showBgTint ? bgColor : na, title="Confluence Background")
+
+// ---------------------------------------------------------------------------
+// DASHBOARD TABLE
+// ---------------------------------------------------------------------------
+
+if showDashboard and barstate.islast
+    var table dashboard = table.new(position.top_right, 2, 18,
+         bgcolor=color.new(color.black, 15), border_width=1, border_color=color.gray,
+         frame_width=1, frame_color=color.gray)
+
+    headerBg = color.new(#1a1a2e, 0)
+    textCol  = color.white
+
+    // Signal color
+    sigColor = signalDir == "STRONG BUY"  ? color.lime :
+               signalDir == "BUY"          ? color.green :
+               signalDir == "STRONG SELL"  ? color.red :
+               signalDir == "SELL"         ? #ff6666 :
+               color.gray
+
+    // Row 0: Header
+    table.cell(dashboard, 0, 0, "Stock Downloader", text_color=textCol, bgcolor=headerBg,
+         text_size=size.small, text_halign=text.align_center)
+    table.merge_cells(dashboard, 0, 0, 1, 0)
+
+    // Row 1: Signal
+    table.cell(dashboard, 0, 1, "Signal", text_color=textCol, bgcolor=headerBg, text_size=size.small)
+    table.cell(dashboard, 1, 1, signalDir + " (" + str.tostring(confluenceScore * 100, "#.0") + "%)",
+         text_color=sigColor, bgcolor=headerBg, text_size=size.small)
+
+    // Row 2: Confluence
+    table.cell(dashboard, 0, 2, "Bullish / Bearish", text_color=textCol, bgcolor=headerBg, text_size=size.small)
+    table.cell(dashboard, 1, 2, str.tostring(bullishCount) + " / " + str.tostring(bearishCount),
+         text_color=textCol, bgcolor=headerBg, text_size=size.small)
+
+    // Row 3: separator
+    sepBg = color.new(#2a2a4a, 0)
+    table.cell(dashboard, 0, 3, "--- Trend ---", text_color=color.yellow, bgcolor=sepBg,
+         text_size=size.tiny, text_halign=text.align_center)
+    table.merge_cells(dashboard, 0, 3, 1, 3)
+
+    // Row 4: EMA 12/26
+    table.cell(dashboard, 0, 4, "EMA 12/26", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(dashboard, 1, 4, ema12 > ema26 ? "Bullish" : "Bearish",
+         text_color=ema12 > ema26 ? color.green : color.red, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 5: SMA 200
+    table.cell(dashboard, 0, 5, "SMA 200", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(dashboard, 1, 5, close > sma200 ? "Above" : "Below",
+         text_color=close > sma200 ? color.green : color.red, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 6: Ichimoku
+    table.cell(dashboard, 0, 6, "Ichimoku Cloud", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(dashboard, 1, 6, priceAboveCloud ? "Above" : "Below",
+         text_color=priceAboveCloud ? color.green : color.red, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 7: ADX
+    table.cell(dashboard, 0, 7, "ADX (" + str.tostring(adxVal, "#.1") + ")", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    adxLabel = adxVal > 25 ? (diPlus > diMinus ? "Strong Up" : "Strong Down") : "Weak/Range"
+    adxColor = adxVal > 25 ? (diPlus > diMinus ? color.green : color.red) : color.gray
+    table.cell(dashboard, 1, 7, adxLabel, text_color=adxColor, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 8: separator
+    table.cell(dashboard, 0, 8, "--- Momentum ---", text_color=color.yellow, bgcolor=sepBg,
+         text_size=size.tiny, text_halign=text.align_center)
+    table.merge_cells(dashboard, 0, 8, 1, 8)
+
+    // Row 9: RSI
+    rsiColor = rsiVal < 30 ? color.green : rsiVal > 70 ? color.red : color.gray
+    table.cell(dashboard, 0, 9, "RSI (14)", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(dashboard, 1, 9, str.tostring(rsiVal, "#.1"),
+         text_color=rsiColor, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 10: MACD
+    macdColor = macdLine > macdSig ? color.green : color.red
+    table.cell(dashboard, 0, 10, "MACD", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(dashboard, 1, 10, macdLine > macdSig ? "Bullish" : "Bearish",
+         text_color=macdColor, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 11: Stochastic
+    stochColor = stochK < 20 ? color.green : stochK > 80 ? color.red : color.gray
+    table.cell(dashboard, 0, 11, "Stoch %K", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(dashboard, 1, 11, str.tostring(stochK, "#.1"),
+         text_color=stochColor, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 12: separator
+    table.cell(dashboard, 0, 12, "--- Volume ---", text_color=color.yellow, bgcolor=sepBg,
+         text_size=size.tiny, text_halign=text.align_center)
+    table.merge_cells(dashboard, 0, 12, 1, 12)
+
+    // Row 13: OBV
+    table.cell(dashboard, 0, 13, "OBV", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(dashboard, 1, 13, obvRising ? "Rising" : "Falling",
+         text_color=obvRising ? color.green : color.red, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 14: MFI
+    mfiColor = mfiVal < 20 ? color.green : mfiVal > 80 ? color.red : color.gray
+    table.cell(dashboard, 0, 14, "MFI (14)", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(dashboard, 1, 14, str.tostring(mfiVal, "#.1"),
+         text_color=mfiColor, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 15: separator
+    table.cell(dashboard, 0, 15, "--- Volatility ---", text_color=color.yellow, bgcolor=sepBg,
+         text_size=size.tiny, text_halign=text.align_center)
+    table.merge_cells(dashboard, 0, 15, 1, 15)
+
+    // Row 16: BB %B
+    bbColor = bbPctB <= 0 ? color.green : bbPctB >= 1 ? color.red : color.gray
+    table.cell(dashboard, 0, 16, "BB %B", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(dashboard, 1, 16, str.tostring(bbPctB, "#.2") + (isSqueeze ? " [SQUEEZE]" : ""),
+         text_color=bbColor, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 17: ATR
+    table.cell(dashboard, 0, 17, "ATR (14)", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(dashboard, 1, 17, str.tostring(atrVal, "#.2"),
+         text_color=color.gray, bgcolor=headerBg, text_size=size.tiny)
