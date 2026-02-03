@@ -10,6 +10,7 @@
 // Use with companion scripts:
 //   - stockdownloader_strategy.pine  (trading strategy)
 //   - stockdownloader_dashboard.pine (confluence scanner)
+//   - stockdownloader_wheel.pine     (wheel strategy timing)
 
 //@version=6
 indicator("StockDownloader Overlay", overlay=true,

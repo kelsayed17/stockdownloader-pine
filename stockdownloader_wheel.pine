@@ -1,0 +1,652 @@
+// This Pine Script source code is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+//
+// Stock Downloader Wheel Strategy Timing
+//
+// Identifies the best times to sell covered calls (CC) and cash-secured puts
+// (CSP) for the wheel strategy. Scores each opportunity using volatility rank,
+// support/resistance proximity, momentum, mean reversion, and trend context.
+//
+// Wheel Strategy Cycle:
+//   1. Sell Cash-Secured Puts (CSP) on a stock you want to own
+//   2. If assigned, you own the stock -- switch to selling Covered Calls (CC)
+//   3. If called away, go back to step 1
+//
+// Key Timing Principles:
+//   - Sell options when volatility is HIGH (richer premiums)
+//   - Sell CSP near SUPPORT with bullish bias (lower assignment risk)
+//   - Sell CC near RESISTANCE with fading momentum (lower call-away risk)
+//
+// Use with companion scripts:
+//   - stockdownloader_strategy.pine  (trading strategy)
+//   - stockdownloader_dashboard.pine (confluence scanner)
+//   - stockdownloader_overlay.pine   (visual indicators)
+
+//@version=6
+indicator("StockDownloader Wheel Strategy", overlay=true,
+     max_labels_count=500, max_lines_count=500)
+
+// ---------------------------------------------------------------------------
+// INPUTS
+// ---------------------------------------------------------------------------
+
+string WHEEL_GROUP  = "Wheel Strategy Settings"
+string HV_GROUP     = "Volatility Settings"
+string CSP_GROUP    = "Cash-Secured Put Timing"
+string CC_GROUP     = "Covered Call Timing"
+string STRIKE_GROUP = "Strike Guidance"
+string VIS_GROUP    = "Display Settings"
+
+// Wheel phase (manual toggle -- user sets based on current position)
+wheelPhase = input.string("Sell CSP", title="Current Wheel Phase",
+     options=["Sell CSP", "Sell CC", "Auto (Show Both)"],
+     group=WHEEL_GROUP,
+     tooltip="Set based on your current position:\n" +
+             "Sell CSP = Looking to enter stock via put assignment\n" +
+             "Sell CC = Already own stock, selling calls for income\n" +
+             "Auto = Show both signals simultaneously")
+
+// Volatility settings
+hvPeriod    = input.int(20, "HV Calculation Period (bars)", minval=5, maxval=100, group=HV_GROUP,
+     tooltip="Period for historical volatility calculation. 20 = ~1 month on daily charts.")
+hvRankLen   = input.int(252, "HV Rank Lookback (bars)", minval=50, maxval=504, group=HV_GROUP,
+     tooltip="Lookback for HV percentile rank. 252 = ~1 year on daily charts.")
+hvHighPct   = input.float(50.0, "HV Rank 'High' Threshold (%)", minval=20, maxval=90, step=5, group=HV_GROUP,
+     tooltip="HV rank above this = elevated volatility = richer premiums.")
+hvVeryHighPct = input.float(75.0, "HV Rank 'Very High' Threshold (%)", minval=50, maxval=95, step=5, group=HV_GROUP,
+     tooltip="HV rank above this = very elevated volatility = best premiums.")
+
+// CSP Timing thresholds
+cspMinScore = input.float(60.0, "CSP Minimum Signal Score", minval=30, maxval=90, step=5, group=CSP_GROUP,
+     tooltip="Minimum score to generate a Sell CSP signal.")
+cspStrongScore = input.float(75.0, "CSP Strong Signal Score", minval=50, maxval=95, step=5, group=CSP_GROUP,
+     tooltip="Score at or above this = strong CSP opportunity.")
+
+// CC Timing thresholds
+ccMinScore = input.float(60.0, "CC Minimum Signal Score", minval=30, maxval=90, step=5, group=CC_GROUP,
+     tooltip="Minimum score to generate a Sell CC signal.")
+ccStrongScore = input.float(75.0, "CC Strong Signal Score", minval=50, maxval=95, step=5, group=CC_GROUP,
+     tooltip="Score at or above this = strong CC opportunity.")
+
+// Strike guidance
+strikeATRMult  = input.float(1.0, "OTM Strike Distance (ATR multiplier)", minval=0.5, maxval=3.0, step=0.25, group=STRIKE_GROUP,
+     tooltip="How far OTM to suggest strikes. 1.0 = one ATR away from current price.")
+showStrikeLines = input.bool(true, "Show Suggested Strike Levels", group=STRIKE_GROUP)
+
+// Display settings
+showDashboard   = input.bool(true, "Show Wheel Dashboard", group=VIS_GROUP)
+showSignalLabels = input.bool(true, "Show Signal Labels on Chart", group=VIS_GROUP)
+showBgTint      = input.bool(true, "Show Background Tint on Signals", group=VIS_GROUP)
+maxSignalLabels = input.int(20, "Max Signal Labels to Display", minval=5, maxval=100, group=VIS_GROUP)
+
+// ---------------------------------------------------------------------------
+// TECHNICAL INDICATORS
+// ---------------------------------------------------------------------------
+
+// Moving Averages
+sma20   = ta.sma(close, 20)
+sma50   = ta.sma(close, 50)
+sma200  = ta.sma(close, 200)
+ema12   = ta.ema(close, 12)
+ema26   = ta.ema(close, 26)
+ema200  = ta.ema(close, 200)
+
+// RSI
+rsiVal  = ta.rsi(close, 14)
+prevRSI = rsiVal[1]
+
+// MACD
+[macdLine, macdSig, macdHist] = ta.macd(close, 12, 26, 9)
+
+// Bollinger Bands
+bbBasis = ta.sma(close, 20)
+bbDev   = ta.stdev(close, 20) * 2.0
+bbUpper = bbBasis + bbDev
+bbLower = bbBasis - bbDev
+bbWidth = bbBasis != 0 ? (bbUpper - bbLower) / bbBasis : 0
+bbPctB  = (bbUpper - bbLower) != 0 ? (close - bbLower) / (bbUpper - bbLower) : 0.5
+
+// Stochastic
+stochK_raw = ta.stoch(close, high, low, 14)
+stochK     = ta.sma(stochK_raw, 3)
+stochD     = ta.sma(stochK, 3)
+
+// Williams %R
+williamsR = -100 * (ta.highest(high, 14) - close) / (ta.highest(high, 14) - ta.lowest(low, 14))
+
+// ADX / DI
+[diPlus, diMinus, adxVal] = ta.dmi(14, 14)
+
+// ATR
+atrVal = ta.atr(14)
+
+// OBV
+obvVal    = ta.obv
+obvSmaF   = ta.sma(obvVal, 5)
+obvSmaS   = ta.sma(obvVal, 20)
+obvRising = obvSmaF > obvSmaS
+
+// MFI
+mfiVal = ta.mfi(hlc3, 14)
+
+// Volume Average
+avgVol20 = ta.sma(volume, 20)
+
+// Parabolic SAR
+sarVal     = ta.sar(0.02, 0.02, 0.2)
+sarBullish = close > sarVal
+
+// Ichimoku
+tenkan = (ta.highest(high, 9) + ta.lowest(low, 9)) / 2
+kijun  = (ta.highest(high, 26) + ta.lowest(low, 26)) / 2
+spanA  = (tenkan + kijun) / 2
+spanB  = (ta.highest(high, 52) + ta.lowest(low, 52)) / 2
+priceAboveCloud = close > math.max(spanA, spanB)
+priceBelowCloud = close < math.min(spanA, spanB)
+
+// Support & Resistance (Swing Pivots)
+swingHigh = ta.pivothigh(high, 10, 10)
+swingLow  = ta.pivotlow(low, 10, 10)
+
+// Track most recent swing levels
+var float lastResistance = na
+var float lastSupport    = na
+if not na(swingHigh)
+    lastResistance := swingHigh
+if not na(swingLow)
+    lastSupport := swingLow
+
+// Distance to support / resistance (as % of price)
+float distToSupport    = not na(lastSupport) and lastSupport > 0 ? (close - lastSupport) / close * 100 : na
+float distToResistance = not na(lastResistance) and lastResistance > 0 ? (lastResistance - close) / close * 100 : na
+
+// ---------------------------------------------------------------------------
+// HISTORICAL VOLATILITY RANK (IV PROXY)
+// ---------------------------------------------------------------------------
+//
+// Since Pine Script cannot access implied volatility directly, we use
+// historical volatility percentile rank as a proxy. When HV is high
+// relative to its recent history, IV tends to also be elevated, meaning
+// option premiums are richer -- the ideal time to sell options.
+//
+
+// Close-to-close historical volatility (annualized)
+float dailyReturn = math.log(close / close[1])
+float hvRaw       = ta.stdev(dailyReturn, hvPeriod) * math.sqrt(252) * 100
+
+// HV Percentile Rank: what % of the lookback period had lower HV
+float hvRank = ta.percentrank(hvRaw, hvRankLen)
+
+// HV classification
+bool hvIsHigh     = hvRank >= hvHighPct
+bool hvIsVeryHigh = hvRank >= hvVeryHighPct
+
+// ---------------------------------------------------------------------------
+// CASH-SECURED PUT (CSP) TIMING SCORE
+// ---------------------------------------------------------------------------
+//
+// Best time to sell CSPs:
+//   - High volatility (rich premiums)
+//   - Price near support (lower chance of deep ITM assignment)
+//   - Oversold momentum (bounce expected)
+//   - Bullish longer-term trend (you want the stock to recover)
+//   - Mean reversion conditions (price stretched to downside)
+//
+
+float cspScore = 0.0
+float cspMax   = 0.0
+
+// --- Factor 1: Volatility Rank (0-25 points) ---
+// Higher HV rank = richer put premiums
+cspMax += 25.0
+if hvIsVeryHigh
+    cspScore += 25.0
+else if hvIsHigh
+    cspScore += 15.0
+else if hvRank >= 30
+    cspScore += 5.0
+
+// --- Factor 2: Support Proximity (0-20 points) ---
+// Price near support = safer put strike zone
+cspMax += 20.0
+if not na(distToSupport)
+    if distToSupport <= 1.0         // Within 1% of support
+        cspScore += 20.0
+    else if distToSupport <= 2.5    // Within 2.5%
+        cspScore += 15.0
+    else if distToSupport <= 5.0    // Within 5%
+        cspScore += 8.0
+
+// Also score BB lower band proximity
+float bbLowerDist = bbBasis != 0 ? (close - bbLower) / close * 100 : na
+if not na(bbLowerDist) and bbLowerDist <= 1.0
+    cspScore += math.min(cspScore + 5.0, cspMax) - cspScore  // Bonus cap
+
+// --- Factor 3: RSI Oversold / Recovering (0-15 points) ---
+// Oversold = higher put premium + bounce expected
+cspMax += 15.0
+if rsiVal < 30
+    cspScore += 15.0
+else if rsiVal < 40 and prevRSI < rsiVal
+    cspScore += 12.0      // Recovering from oversold
+else if rsiVal < 45
+    cspScore += 5.0
+
+// --- Factor 4: Bullish Trend Context (0-15 points) ---
+// You want to own the stock -- bullish bias required
+cspMax += 15.0
+float trendPoints = 0.0
+if close > sma200 or (sma200 > 0 and close > sma200 * 0.97)
+    trendPoints += 5.0     // At or above long-term trend
+if close > ema200 or (ema200 > 0 and close > ema200 * 0.97)
+    trendPoints += 3.0
+if sma50 > sma200
+    trendPoints += 4.0     // Golden cross in effect
+if priceAboveCloud
+    trendPoints += 3.0
+cspScore += math.min(trendPoints, 15.0)
+
+// --- Factor 5: Mean Reversion Setup (0-10 points) ---
+// Price stretched to downside = likely to snap back
+cspMax += 10.0
+if bbPctB <= 0.05
+    cspScore += 10.0       // At or below lower BB
+else if bbPctB <= 0.20
+    cspScore += 7.0
+else if bbPctB <= 0.35
+    cspScore += 3.0
+
+// --- Factor 6: Stochastic Oversold (0-5 points) ---
+cspMax += 5.0
+if stochK < 20
+    cspScore += 5.0
+else if stochK < 30
+    cspScore += 3.0
+
+// --- Factor 7: MFI Oversold (0-5 points) ---
+// Volume-weighted oversold = smart money accumulating
+cspMax += 5.0
+if mfiVal < 20
+    cspScore += 5.0
+else if mfiVal < 30
+    cspScore += 3.0
+
+// --- Factor 8: Accumulation / OBV (0-5 points) ---
+cspMax += 5.0
+if obvRising
+    cspScore += 5.0        // Buyers accumulating despite price weakness = bullish
+
+// Normalize to 0-100
+float cspPct = cspMax > 0 ? (cspScore / cspMax) * 100 : 0.0
+
+// ---------------------------------------------------------------------------
+// COVERED CALL (CC) TIMING SCORE
+// ---------------------------------------------------------------------------
+//
+// Best time to sell CCs:
+//   - High volatility (rich premiums)
+//   - Price near resistance (natural ceiling limits upside)
+//   - Overbought momentum (pullback expected)
+//   - Fading momentum (rally losing steam)
+//   - Mean reversion conditions (price stretched to upside)
+//
+
+float ccScore = 0.0
+float ccMax   = 0.0
+
+// --- Factor 1: Volatility Rank (0-25 points) ---
+ccMax += 25.0
+if hvIsVeryHigh
+    ccScore += 25.0
+else if hvIsHigh
+    ccScore += 15.0
+else if hvRank >= 30
+    ccScore += 5.0
+
+// --- Factor 2: Resistance Proximity (0-20 points) ---
+// Price near resistance = natural cap on upside
+ccMax += 20.0
+if not na(distToResistance)
+    if distToResistance <= 1.0
+        ccScore += 20.0
+    else if distToResistance <= 2.5
+        ccScore += 15.0
+    else if distToResistance <= 5.0
+        ccScore += 8.0
+
+// Also score BB upper band proximity
+float bbUpperDist = bbBasis != 0 ? (bbUpper - close) / close * 100 : na
+if not na(bbUpperDist) and bbUpperDist <= 1.0
+    ccScore += math.min(ccScore + 5.0, ccMax) - ccScore
+
+// --- Factor 3: RSI Overbought / Declining (0-15 points) ---
+ccMax += 15.0
+if rsiVal > 70
+    ccScore += 15.0
+else if rsiVal > 60 and prevRSI > rsiVal
+    ccScore += 12.0        // Declining from overbought
+else if rsiVal > 55
+    ccScore += 5.0
+
+// --- Factor 4: Fading Momentum (0-15 points) ---
+// Rally losing steam = good time to cap upside with calls
+ccMax += 15.0
+float momentumFadePoints = 0.0
+if macdHist < macdHist[1] and macdHist[1] < macdHist[2] and macdHist > 0
+    momentumFadePoints += 6.0   // MACD histogram declining while positive
+if macdLine < macdSig and macdLine[1] >= macdSig[1]
+    momentumFadePoints += 5.0   // Fresh bearish MACD crossover
+if adxVal < 25 and adxVal[1] >= 25
+    momentumFadePoints += 4.0   // Trend weakening
+if not sarBullish and sarBullish[1]
+    momentumFadePoints += 4.0   // SAR flip to bearish
+ccScore += math.min(momentumFadePoints, 15.0)
+
+// --- Factor 5: Mean Reversion Setup (0-10 points) ---
+// Price stretched to upside = likely to pull back
+ccMax += 10.0
+if bbPctB >= 0.95
+    ccScore += 10.0
+else if bbPctB >= 0.80
+    ccScore += 7.0
+else if bbPctB >= 0.65
+    ccScore += 3.0
+
+// --- Factor 6: Stochastic Overbought (0-5 points) ---
+ccMax += 5.0
+if stochK > 80
+    ccScore += 5.0
+else if stochK > 70
+    ccScore += 3.0
+
+// --- Factor 7: MFI Overbought (0-5 points) ---
+ccMax += 5.0
+if mfiVal > 80
+    ccScore += 5.0
+else if mfiVal > 70
+    ccScore += 3.0
+
+// --- Factor 8: Distribution / OBV (0-5 points) ---
+ccMax += 5.0
+if not obvRising
+    ccScore += 5.0         // Sellers distributing despite price strength
+
+// Normalize to 0-100
+float ccPct = ccMax > 0 ? (ccScore / ccMax) * 100 : 0.0
+
+// ---------------------------------------------------------------------------
+// SIGNAL CLASSIFICATION
+// ---------------------------------------------------------------------------
+
+// CSP signals
+bool cspSignal       = cspPct >= cspMinScore
+bool cspStrongSignal = cspPct >= cspStrongScore
+
+// CC signals
+bool ccSignal       = ccPct >= ccMinScore
+bool ccStrongSignal = ccPct >= ccStrongScore
+
+// Signal quality labels
+string cspQuality = cspStrongSignal ? "STRONG" : cspSignal ? "GOOD" : cspPct >= 45 ? "MODERATE" : "WEAK"
+string ccQuality  = ccStrongSignal ? "STRONG" : ccSignal ? "GOOD" : ccPct >= 45 ? "MODERATE" : "WEAK"
+
+// Phase-aware signal filtering
+bool showCSP = wheelPhase == "Sell CSP" or wheelPhase == "Auto (Show Both)"
+bool showCC  = wheelPhase == "Sell CC" or wheelPhase == "Auto (Show Both)"
+
+bool activeCSP = cspSignal and showCSP
+bool activeCC  = ccSignal and showCC
+
+// ---------------------------------------------------------------------------
+// STRIKE PRICE GUIDANCE
+// ---------------------------------------------------------------------------
+//
+// Suggest OTM strike levels based on ATR distance from current price.
+// CSP strikes are placed below the current price.
+// CC strikes are placed above the current price.
+//
+
+float cspStrikeLevel = close - atrVal * strikeATRMult
+float ccStrikeLevel  = close + atrVal * strikeATRMult
+
+// Conservative strikes (further OTM for higher probability)
+float cspConservativeStrike = close - atrVal * strikeATRMult * 1.5
+float ccConservativeStrike  = close + atrVal * strikeATRMult * 1.5
+
+// ---------------------------------------------------------------------------
+// CHART VISUALS -- SIGNAL LABELS
+// ---------------------------------------------------------------------------
+
+if showSignalLabels
+    // CSP signal labels
+    if activeCSP and barstate.isconfirmed
+        string cspText = "SELL PUT\n" + cspQuality + " (" + str.tostring(cspPct, "#.0") + ")"
+        color cspColor = cspStrongSignal ? color.lime : color.green
+        label.new(bar_index, low, cspText,
+             style=label.style_label_up, color=color.new(cspColor, 20),
+             textcolor=color.white, size=size.small)
+
+    // CC signal labels
+    if activeCC and barstate.isconfirmed
+        string ccText = "SELL CALL\n" + ccQuality + " (" + str.tostring(ccPct, "#.0") + ")"
+        color ccColor = ccStrongSignal ? #ff4444 : #ff8888
+        label.new(bar_index, high, ccText,
+             style=label.style_label_down, color=color.new(ccColor, 20),
+             textcolor=color.white, size=size.small)
+
+// ---------------------------------------------------------------------------
+// CHART VISUALS -- STRIKE GUIDANCE LINES
+// ---------------------------------------------------------------------------
+
+// Plot suggested strike levels when signals are active
+plot(showStrikeLines and activeCSP ? cspStrikeLevel : na,
+     "CSP Strike (Standard)", color=color.new(color.green, 40),
+     style=plot.style_circles, linewidth=2)
+plot(showStrikeLines and activeCSP ? cspConservativeStrike : na,
+     "CSP Strike (Conservative)", color=color.new(color.green, 60),
+     style=plot.style_cross, linewidth=1)
+
+plot(showStrikeLines and activeCC ? ccStrikeLevel : na,
+     "CC Strike (Standard)", color=color.new(color.red, 40),
+     style=plot.style_circles, linewidth=2)
+plot(showStrikeLines and activeCC ? ccConservativeStrike : na,
+     "CC Strike (Conservative)", color=color.new(color.red, 60),
+     style=plot.style_cross, linewidth=1)
+
+// ---------------------------------------------------------------------------
+// CHART VISUALS -- BACKGROUND TINT
+// ---------------------------------------------------------------------------
+
+color bgCSP = activeCSP ? (cspStrongSignal ? color.new(color.green, 88) : color.new(color.green, 93)) : na
+color bgCC  = activeCC ? (ccStrongSignal ? color.new(color.red, 88) : color.new(color.red, 93)) : na
+
+bgcolor(showBgTint and showCSP ? bgCSP : na, title="CSP Signal Background")
+bgcolor(showBgTint and showCC ? bgCC : na, title="CC Signal Background")
+
+// ---------------------------------------------------------------------------
+// CHART VISUALS -- HV RANK BAR COLORING (subtle)
+// ---------------------------------------------------------------------------
+
+// Show volatility state via bar color intensity when no position signals
+color volBarColor = hvIsVeryHigh ? color.new(color.yellow, 70) :
+                    hvIsHigh     ? color.new(color.yellow, 85) : na
+bgcolor(not activeCSP and not activeCC and showBgTint ? volBarColor : na,
+     title="High Volatility Background")
+
+// ---------------------------------------------------------------------------
+// ALERTS
+// ---------------------------------------------------------------------------
+
+alertcondition(activeCSP, title="Sell CSP Signal",
+     message="WHEEL: Sell Cash-Secured Put signal on {{ticker}} | Score: " +
+             str.tostring(cspPct, "#.0") + " | Quality: " + cspQuality +
+             " | Suggested Strike: " + str.tostring(cspStrikeLevel, "#.##"))
+
+alertcondition(activeCC, title="Sell CC Signal",
+     message="WHEEL: Sell Covered Call signal on {{ticker}} | Score: " +
+             str.tostring(ccPct, "#.0") + " | Quality: " + ccQuality +
+             " | Suggested Strike: " + str.tostring(ccStrikeLevel, "#.##"))
+
+alertcondition(cspStrongSignal and showCSP, title="Strong CSP Signal",
+     message="WHEEL: STRONG Sell CSP signal on {{ticker}} | Score: " +
+             str.tostring(cspPct, "#.0"))
+
+alertcondition(ccStrongSignal and showCC, title="Strong CC Signal",
+     message="WHEEL: STRONG Sell CC signal on {{ticker}} | Score: " +
+             str.tostring(ccPct, "#.0"))
+
+alertcondition(hvIsVeryHigh, title="Very High Volatility",
+     message="WHEEL: Very high volatility on {{ticker}} (HV Rank: " +
+             str.tostring(hvRank, "#.0") + "%) -- ideal for premium selling")
+
+// ---------------------------------------------------------------------------
+// DASHBOARD TABLE
+// ---------------------------------------------------------------------------
+
+if showDashboard and barstate.islast
+    var table wheel = table.new(position.top_right, 2, 24,
+         bgcolor=color.new(color.black, 15), border_width=1, border_color=color.gray,
+         frame_width=1, frame_color=color.gray)
+
+    headerBg = color.new(#1a1a2e, 0)
+    sepBg    = color.new(#2a2a4a, 0)
+    textCol  = color.white
+
+    // ---- Row 0: Title ----
+    table.cell(wheel, 0, 0, "Wheel Strategy", text_color=textCol, bgcolor=headerBg,
+         text_size=size.small, text_halign=text.align_center)
+    table.merge_cells(wheel, 0, 0, 1, 0)
+
+    // ---- Row 1: Current Phase ----
+    string phaseLabel = wheelPhase
+    color phaseColor = wheelPhase == "Sell CSP" ? color.green :
+                       wheelPhase == "Sell CC" ? color.orange : color.gray
+    table.cell(wheel, 0, 1, "Phase", text_color=textCol, bgcolor=headerBg, text_size=size.small)
+    table.cell(wheel, 1, 1, phaseLabel, text_color=phaseColor, bgcolor=headerBg, text_size=size.small)
+
+    // ---- Row 2: Volatility Section ----
+    table.cell(wheel, 0, 2, "--- Volatility ---", text_color=color.yellow, bgcolor=sepBg,
+         text_size=size.tiny, text_halign=text.align_center)
+    table.merge_cells(wheel, 0, 2, 1, 2)
+
+    // Row 3: HV Value
+    table.cell(wheel, 0, 3, "Hist. Vol (ann.)", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(wheel, 1, 3, str.tostring(hvRaw, "#.1") + "%",
+         text_color=color.gray, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 4: HV Rank
+    color hvColor = hvIsVeryHigh ? color.lime : hvIsHigh ? color.green : hvRank >= 30 ? color.gray : color.red
+    string hvLabel = hvIsVeryHigh ? "VERY HIGH" : hvIsHigh ? "HIGH" : hvRank >= 30 ? "MODERATE" : "LOW"
+    table.cell(wheel, 0, 4, "HV Rank", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(wheel, 1, 4, str.tostring(hvRank, "#.0") + "% (" + hvLabel + ")",
+         text_color=hvColor, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 5: ATR
+    table.cell(wheel, 0, 5, "ATR (14)", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(wheel, 1, 5, str.tostring(atrVal, "#.2"),
+         text_color=color.gray, bgcolor=headerBg, text_size=size.tiny)
+
+    // ---- Row 6: CSP Section ----
+    table.cell(wheel, 0, 6, "--- Sell Put (CSP) ---", text_color=color.yellow, bgcolor=sepBg,
+         text_size=size.tiny, text_halign=text.align_center)
+    table.merge_cells(wheel, 0, 6, 1, 6)
+
+    // Row 7: CSP Score
+    color cspScoreColor = cspStrongSignal ? color.lime : cspSignal ? color.green : cspPct >= 45 ? color.gray : color.red
+    table.cell(wheel, 0, 7, "CSP Score", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(wheel, 1, 7, str.tostring(cspPct, "#.0") + " / 100 (" + cspQuality + ")",
+         text_color=cspScoreColor, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 8: CSP Signal
+    string cspSigLabel = activeCSP ? (cspStrongSignal ? "SELL PUT NOW" : "SELL PUT") : "WAIT"
+    color cspSigColor = activeCSP ? (cspStrongSignal ? color.lime : color.green) : color.gray
+    table.cell(wheel, 0, 8, "CSP Signal", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(wheel, 1, 8, cspSigLabel, text_color=cspSigColor, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 9: CSP Strike Guidance
+    table.cell(wheel, 0, 9, "Put Strike (Std)", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(wheel, 1, 9, str.tostring(cspStrikeLevel, "#.##"),
+         text_color=color.green, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 10: CSP Conservative Strike
+    table.cell(wheel, 0, 10, "Put Strike (Safe)", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(wheel, 1, 10, str.tostring(cspConservativeStrike, "#.##"),
+         text_color=color.new(color.green, 30), bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 11: Support
+    string supportLabel = not na(lastSupport) ? str.tostring(lastSupport, "#.##") +
+         " (" + str.tostring(distToSupport, "#.1") + "% away)" : "N/A"
+    table.cell(wheel, 0, 11, "Nearest Support", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(wheel, 1, 11, supportLabel,
+         text_color=color.green, bgcolor=headerBg, text_size=size.tiny)
+
+    // ---- Row 12: CC Section ----
+    table.cell(wheel, 0, 12, "--- Sell Call (CC) ---", text_color=color.yellow, bgcolor=sepBg,
+         text_size=size.tiny, text_halign=text.align_center)
+    table.merge_cells(wheel, 0, 12, 1, 12)
+
+    // Row 13: CC Score
+    color ccScoreColor = ccStrongSignal ? color.lime : ccSignal ? color.green : ccPct >= 45 ? color.gray : color.red
+    table.cell(wheel, 0, 13, "CC Score", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(wheel, 1, 13, str.tostring(ccPct, "#.0") + " / 100 (" + ccQuality + ")",
+         text_color=ccScoreColor, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 14: CC Signal
+    string ccSigLabel = activeCC ? (ccStrongSignal ? "SELL CALL NOW" : "SELL CALL") : "WAIT"
+    color ccSigColor = activeCC ? (ccStrongSignal ? color.lime : color.green) : color.gray
+    table.cell(wheel, 0, 14, "CC Signal", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(wheel, 1, 14, ccSigLabel, text_color=ccSigColor, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 15: CC Strike Guidance
+    table.cell(wheel, 0, 15, "Call Strike (Std)", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(wheel, 1, 15, str.tostring(ccStrikeLevel, "#.##"),
+         text_color=color.red, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 16: CC Conservative Strike
+    table.cell(wheel, 0, 16, "Call Strike (Safe)", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(wheel, 1, 16, str.tostring(ccConservativeStrike, "#.##"),
+         text_color=color.new(color.red, 30), bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 17: Resistance
+    string resistLabel = not na(lastResistance) ? str.tostring(lastResistance, "#.##") +
+         " (" + str.tostring(distToResistance, "#.1") + "% away)" : "N/A"
+    table.cell(wheel, 0, 17, "Nearest Resistance", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(wheel, 1, 17, resistLabel,
+         text_color=color.red, bgcolor=headerBg, text_size=size.tiny)
+
+    // ---- Row 18: Key Indicators ----
+    table.cell(wheel, 0, 18, "--- Key Indicators ---", text_color=color.yellow, bgcolor=sepBg,
+         text_size=size.tiny, text_halign=text.align_center)
+    table.merge_cells(wheel, 0, 18, 1, 18)
+
+    // Row 19: RSI
+    rsiColor = rsiVal < 30 ? color.green : rsiVal > 70 ? color.red : color.gray
+    table.cell(wheel, 0, 19, "RSI (14)", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(wheel, 1, 19, str.tostring(rsiVal, "#.1"),
+         text_color=rsiColor, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 20: BB %B
+    bbColor = bbPctB <= 0.2 ? color.green : bbPctB >= 0.8 ? color.red : color.gray
+    table.cell(wheel, 0, 20, "BB %B", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(wheel, 1, 20, str.tostring(bbPctB, "#.2"),
+         text_color=bbColor, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 21: Stochastic
+    stochColor = stochK < 20 ? color.green : stochK > 80 ? color.red : color.gray
+    table.cell(wheel, 0, 21, "Stoch %K", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(wheel, 1, 21, str.tostring(stochK, "#.1"),
+         text_color=stochColor, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 22: Trend
+    bool bullTrend = close > sma200 and sma50 > sma200
+    bool bearTrend = close < sma200 and sma50 < sma200
+    string trendLabel = bullTrend ? "BULLISH" : bearTrend ? "BEARISH" : "MIXED"
+    color trendColor = bullTrend ? color.green : bearTrend ? color.red : color.gray
+    table.cell(wheel, 0, 22, "Trend (SMA)", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(wheel, 1, 22, trendLabel,
+         text_color=trendColor, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 23: OBV
+    table.cell(wheel, 0, 23, "OBV Trend", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(wheel, 1, 23, obvRising ? "Accumulation" : "Distribution",
+         text_color=obvRising ? color.green : color.red, bgcolor=headerBg, text_size=size.tiny)
