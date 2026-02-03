@@ -10,6 +10,7 @@
 // Use with companion scripts:
 //   - stockdownloader_strategy.pine (trading strategy)
 //   - stockdownloader_overlay.pine  (visual indicators)
+//   - stockdownloader_wheel.pine    (wheel strategy timing)
 
 //@version=6
 indicator("StockDownloader Dashboard", overlay=true)
