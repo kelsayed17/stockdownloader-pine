@@ -1,34 +1,42 @@
-// This Pine Script™ source code is subject to the terms of the Mozilla Public License 2.0
+// This Pine Script source code is subject to the terms of the Mozilla Public License 2.0
 // https://mozilla.org/MPL/2.0/
 //
-// Stock Downloader — Multi-Strategy Trading System
+// Stock Downloader Strategy
 //
-// A comprehensive TradingView strategy that ports all 9 equity strategies and
-// 13+ technical indicators from the Stock Downloader backtesting platform.
+// Core trading strategy with Call (Long) and Put (Short) entry/exit signals.
+// Includes ATR-based risk management, trailing stops, trend filters,
+// volume confirmation, trade cooldown, and weighted confluence scoring.
 //
 // Strategies:
-//   1. SMA Crossover (50/200) — Golden/Death Cross
-//   2. SMA Crossover (20/50)  — Medium-term trend following
-//   3. RSI (14, 30/70)        — Standard mean reversion
-//   4. RSI (14, 25/75)        — Aggressive mean reversion
-//   5. MACD (12/26/9)         — Momentum crossover
-//   6. BB + RSI Mean Reversion — Multi-indicator mean reversion
-//   7. Momentum Confluence     — MACD + ADX + EMA trend filter
-//   8. Breakout                — BB squeeze + volume confirmation
-//   9. Multi-Indicator         — 8-factor confluence scoring
+//   1. SMA Crossover (50/200)
+//   2. SMA Crossover (20/50)
+//   3. RSI (14, 30/70)
+//   4. RSI (14, 25/75)
+//   5. MACD (12/26/9)
+//   6. BB + RSI Mean Reversion
+//   7. Momentum Confluence
+//   8. Breakout
+//   9. Multi-Indicator Confluence (weighted)
 //
-// Signal Generator:
-//   Confluence-based scoring across trend, momentum, volume, and volatility
-//   categories producing STRONG_BUY / BUY / NEUTRAL / SELL / STRONG_SELL signals.
+// Use with companion scripts:
+//   - stockdownloader_overlay.pine   (visual indicators)
+//   - stockdownloader_dashboard.pine (confluence scanner)
 
 //@version=6
-strategy("Stock Downloader Multi-Strategy", overlay=true, default_qty_type=strategy.percent_of_equity,
-     default_qty_value=100, initial_capital=100000, commission_value=0,
-     process_orders_on_close=true, max_labels_count=500, max_lines_count=500)
+strategy("StockDownloader Strategy", overlay=true,
+     default_qty_type=strategy.percent_of_equity,
+     default_qty_value=10,
+     initial_capital=100000,
+     commission_value=0.05,
+     slippage=1,
+     process_orders_on_close=false,
+     pyramiding=0,
+     calc_on_every_tick=true,
+     max_labels_count=500)
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
 // INPUTS
-// ─────────────────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
 
 string STRAT_GROUP    = "Strategy Selection"
 string SMA_GROUP      = "SMA Crossover Settings"
@@ -38,7 +46,10 @@ string BB_RSI_GROUP   = "BB + RSI Mean Reversion Settings"
 string MOM_GROUP      = "Momentum Confluence Settings"
 string BRK_GROUP      = "Breakout Settings"
 string MULTI_GROUP    = "Multi-Indicator Settings"
-string VIS_GROUP      = "Display Settings"
+string RISK_GROUP     = "Risk Management"
+string TRAIL_GROUP    = "Trailing Stop Settings"
+string FILTER_GROUP   = "Trade Filters"
+string SCORING_GROUP  = "Confluence Scoring Weights"
 
 // Strategy selector
 strategyChoice = input.string("Multi-Indicator Confluence", title="Active Strategy",
@@ -46,6 +57,7 @@ strategyChoice = input.string("Multi-Indicator Confluence", title="Active Strate
               "RSI (25/75)", "MACD (12/26/9)", "BB + RSI Mean Reversion",
               "Momentum Confluence", "Breakout", "Multi-Indicator Confluence"],
      group=STRAT_GROUP)
+enableShorts = input.bool(true, "Enable Put (Short) Entries", group=STRAT_GROUP)
 
 // SMA Crossover
 smaShort1  = input.int(50, "Short SMA", minval=1, group=SMA_GROUP)
@@ -76,21 +88,41 @@ brkSqzLookback = input.int(120, "Squeeze Lookback", minval=10, group=BRK_GROUP)
 brkVolMult     = input.float(1.5, "Volume Multiplier", minval=1.0, step=0.1, group=BRK_GROUP)
 
 // Multi-Indicator Confluence
-multiBuyThresh  = input.int(4, "Buy Threshold (out of 8)", minval=1, maxval=8, group=MULTI_GROUP)
-multiSellThresh = input.int(4, "Sell Threshold (out of 8)", minval=1, maxval=8, group=MULTI_GROUP)
+multiBuyThreshPct  = input.float(50.0, "Buy Threshold (%)", minval=10, maxval=100, step=5, group=MULTI_GROUP)
+multiSellThreshPct = input.float(50.0, "Sell Threshold (%)", minval=10, maxval=100, step=5, group=MULTI_GROUP)
 
-// Display
-showDashboard   = input.bool(true, "Show Confluence Dashboard", group=VIS_GROUP)
-showSR          = input.bool(true, "Show Support/Resistance Levels", group=VIS_GROUP)
-showBBOverlay   = input.bool(false, "Show Bollinger Bands Overlay", group=VIS_GROUP)
-showIchimoku    = input.bool(false, "Show Ichimoku Cloud", group=VIS_GROUP)
-showSAROverlay  = input.bool(false, "Show Parabolic SAR Dots", group=VIS_GROUP)
+// Risk Management
+atrPeriod       = input.int(14, "ATR Period", minval=1, group=RISK_GROUP)
+slMultiplier    = input.float(1.5, "Stop-Loss ATR Multiplier", minval=0.5, step=0.1, group=RISK_GROUP)
+tpMultiplier    = input.float(3.0, "Take-Profit ATR Multiplier", minval=1.0, step=0.1, group=RISK_GROUP)
+riskPerTrade    = input.float(2.0, "Risk Per Trade (%)", minval=0.5, maxval=10, step=0.5, group=RISK_GROUP)
 
-// ─────────────────────────────────────────────────────────────────────────────
-// TECHNICAL INDICATORS — computed once, used by all strategies
-// ─────────────────────────────────────────────────────────────────────────────
+// Trailing Stop
+useTrailingStop = input.bool(true, "Enable Trailing Stop", group=TRAIL_GROUP)
+trailATRMult    = input.float(2.0, "Trailing Stop ATR Multiplier", minval=0.5, step=0.1, group=TRAIL_GROUP)
+trailActivation = input.float(1.5, "Trailing Activation ATR Mult", minval=0.5, step=0.1, group=TRAIL_GROUP)
 
-// === Moving Averages ===
+// Trade Filters
+useTrendFilter  = input.bool(true, "Require EMA200 Trend Alignment", group=FILTER_GROUP)
+useVolFilter    = input.bool(true, "Require Volume Confirmation", group=FILTER_GROUP)
+volFilterMult   = input.float(0.8, "Min Volume / 20-bar Avg", minval=0.1, step=0.1, group=FILTER_GROUP)
+cooldownBars    = input.int(3, "Cooldown Bars After Exit", minval=0, maxval=50, group=FILTER_GROUP)
+
+// Confluence Scoring Weights (for Multi-Indicator strategy)
+wTrendEma     = input.float(1.5, "EMA 12/26 Trend Weight", minval=0, maxval=5, step=0.5, group=SCORING_GROUP)
+wTrendSma200  = input.float(2.0, "SMA 200 Trend Weight", minval=0, maxval=5, step=0.5, group=SCORING_GROUP)
+wTrendIchi    = input.float(1.0, "Ichimoku Cloud Weight", minval=0, maxval=5, step=0.5, group=SCORING_GROUP)
+wMomRsi       = input.float(1.0, "RSI Recovery Weight", minval=0, maxval=5, step=0.5, group=SCORING_GROUP)
+wMomMacd      = input.float(1.5, "MACD Crossover Weight", minval=0, maxval=5, step=0.5, group=SCORING_GROUP)
+wMomStoch     = input.float(0.5, "Stochastic Crossover Weight", minval=0, maxval=5, step=0.5, group=SCORING_GROUP)
+wVolObv       = input.float(1.0, "OBV Trend Weight", minval=0, maxval=5, step=0.5, group=SCORING_GROUP)
+wVolMfi       = input.float(0.5, "MFI Recovery Weight", minval=0, maxval=5, step=0.5, group=SCORING_GROUP)
+
+// ---------------------------------------------------------------------------
+// TECHNICAL INDICATORS
+// ---------------------------------------------------------------------------
+
+// Moving Averages
 sma20   = ta.sma(close, 20)
 sma50   = ta.sma(close, 50)
 sma200  = ta.sma(close, 200)
@@ -102,92 +134,80 @@ ema200  = ta.ema(close, 200)
 smaShortVal = ta.sma(close, smaShort1)
 smaLongVal  = ta.sma(close, smaLong1)
 
-// === RSI ===
+// RSI
 rsiVal     = ta.rsi(close, rsiPeriod)
 prevRSI    = rsiVal[1]
 
-// === MACD ===
+// MACD
 [macdLine, macdSig, macdHist] = ta.macd(close, macdFast, macdSlow, macdSignal)
 
-// === Bollinger Bands ===
+// Bollinger Bands
 bbBasis  = ta.sma(close, bbPeriod)
 bbDev    = ta.stdev(close, bbPeriod) * bbMult
 bbUpper  = bbBasis + bbDev
 bbLower  = bbBasis - bbDev
-bbWidth  = (bbUpper - bbLower) / bbBasis
-bbPctB   = bbBasis != 0 ? (close - bbLower) / (bbUpper - bbLower) : 0.5
+bbWidth  = bbBasis != 0 ? (bbUpper - bbLower) / bbBasis : 0
+bbPctB   = (bbUpper - bbLower) != 0 ? (close - bbLower) / (bbUpper - bbLower) : 0.5
 
-// === Stochastic Oscillator ===
+// Stochastic Oscillator
 stochK_raw = ta.stoch(close, high, low, 14)
 stochK     = ta.sma(stochK_raw, 3)
 stochD     = ta.sma(stochK, 3)
 
-// === Williams %R ===
-williamsR = -100 * (ta.highest(high, 14) - close) / (ta.highest(high, 14) - ta.lowest(low, 14))
-
-// === CCI ===
-cciVal = ta.cci(close, 20)
-
-// === ROC ===
-rocVal = ta.roc(close, 12)
-
-// === ADX / DI ===
-adxLen       = 14
+// ADX / DI
+adxLen = 14
 [diPlus, diMinus, adxVal] = ta.dmi(adxLen, adxLen)
 
-// === ATR ===
-atrVal      = ta.atr(14)
-prevATR     = atrVal[1]
+// ATR
+atrVal = ta.atr(atrPeriod)
 
-// === OBV ===
-obvVal      = ta.obv
-obvRising   = ta.sma(obvVal, 5) > ta.sma(obvVal, 5)[1]
+// OBV
+obvVal    = ta.obv
+obvSmaF   = ta.sma(obvVal, 5)
+obvRising = obvSmaF > obvSmaF[1]
 
-// === MFI ===
-mfiVal      = ta.mfi(hlc3, 14)
+// MFI
+mfiVal = ta.mfi(hlc3, 14)
 
-// === VWAP ===
-vwapVal     = ta.vwap(hlc3)
+// Volume Average
+avgVol20 = ta.sma(volume, 20)
 
-// === Parabolic SAR ===
-sarVal      = ta.sar(0.02, 0.02, 0.2)
-sarBullish  = close > sarVal
+// Parabolic SAR
+sarVal     = ta.sar(0.02, 0.02, 0.2)
+sarBullish = close > sarVal
 
-// === Ichimoku Cloud ===
-tenkan      = (ta.highest(high, 9) + ta.lowest(low, 9)) / 2
-kijun       = (ta.highest(high, 26) + ta.lowest(low, 26)) / 2
-spanA       = (tenkan + kijun) / 2
-spanB       = (ta.highest(high, 52) + ta.lowest(low, 52)) / 2
-// Current cloud position (shifted 26 bars ahead for display, but for signals we use current)
+// Ichimoku
+tenkan = (ta.highest(high, 9) + ta.lowest(low, 9)) / 2
+kijun  = (ta.highest(high, 26) + ta.lowest(low, 26)) / 2
+spanA  = (tenkan + kijun) / 2
+spanB  = (ta.highest(high, 52) + ta.lowest(low, 52)) / 2
 priceAboveCloud = close > math.max(spanA, spanB)
+priceBelowCloud = close < math.min(spanA, spanB)
 
-// === Volume Average ===
-avgVol20    = ta.sma(volume, 20)
-
-// ─────────────────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
 // STRATEGY 1 & 2: SMA CROSSOVER
-// ─────────────────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
 
 smaBuy  = ta.crossover(smaShortVal, smaLongVal)
 smaSell = ta.crossunder(smaShortVal, smaLongVal)
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
 // STRATEGY 3 & 4: RSI
-// ─────────────────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
 
 rsiBuy  = ta.crossover(rsiVal, rsiOS)
 rsiSell = ta.crossunder(rsiVal, rsiOB)
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
 // STRATEGY 5: MACD
-// ─────────────────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
 
 macdBuy  = ta.crossover(macdLine, macdSig)
 macdSell = ta.crossunder(macdLine, macdSig)
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
 // STRATEGY 6: BB + RSI MEAN REVERSION
-// ─────────────────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
 
 bbIsRangeBound = adxVal < bbAdxThresh
 
@@ -202,9 +222,9 @@ bbStochOB      = stochK > 80
 bbRsiBuy  = bbIsRangeBound and (bbPriceAtLower or bbRsiRecovery) and bbStochOS
 bbRsiSell = bbIsRangeBound and (bbPriceAtUpper or bbRsiTopping) and bbStochOB
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
 // STRATEGY 7: MOMENTUM CONFLUENCE (MACD + ADX + EMA)
-// ─────────────────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
 
 momEma          = ta.ema(close, momEmaFilt)
 momMacdBullX    = ta.crossover(macdLine, macdSig)
@@ -212,98 +232,116 @@ momMacdBearX    = ta.crossunder(macdLine, macdSig)
 momStrongTrend  = adxVal > momAdxStr
 momWeakTrend    = adxVal < momAdxWeak
 momBullishDI    = diPlus > diMinus
+momBearishDI    = diMinus > diPlus
 momAboveEma     = close > momEma
+momBelowEma     = close < momEma
 momObvConfirm   = obvRising
 
 momBuy  = momMacdBullX and momStrongTrend and momBullishDI and momAboveEma and momObvConfirm
-momSell = momMacdBearX or (momWeakTrend and not momAboveEma)
+momSell = momMacdBearX and momStrongTrend and momBearishDI and momBelowEma
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
 // STRATEGY 8: BREAKOUT (BB Squeeze + Volume + ATR)
-// ─────────────────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
 
-// Detect squeeze: current BB width near its minimum over the lookback period
 bbWidthMin    = ta.lowest(bbWidth, brkSqzLookback)
 isSqueeze     = bbWidth <= bbWidthMin * 1.10
-
-// Volume confirmation
 highVolume    = volume > avgVol20 * brkVolMult
+atrExpanding  = atrVal > atrVal[1]
 
-// ATR expanding
-atrExpanding  = atrVal > prevATR
-
-// Breakout signals
-bullishBreakout = close > bbUpper and close[1] <= bbUpper[1]
+bullishBreakout  = close > bbUpper and close[1] <= bbUpper[1]
 bearishBreakdown = close < bbLower and close[1] >= bbLower[1]
-failedBreakout  = close[1] > bbUpper[1] and close < bbBasis
+failedBreakout   = close[1] > bbUpper[1] and close < bbBasis
 
 brkBuy  = (isSqueeze or atrExpanding) and bullishBreakout and highVolume
-brkSell = bearishBreakdown or failedBreakout
+brkSell = (isSqueeze or atrExpanding) and bearishBreakdown and highVolume
 
-// ─────────────────────────────────────────────────────────────────────────────
-// STRATEGY 9: MULTI-INDICATOR CONFLUENCE
-// ─────────────────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// STRATEGY 9: MULTI-INDICATOR CONFLUENCE (WEIGHTED)
+// ---------------------------------------------------------------------------
 
-// --- Buy Score (8 factors) ---
-buyScore = 0
+// --- Weighted Buy Score ---
+float wBuyScore = 0.0
+float wBuyMax   = 0.0
 
 // Trend: EMA(12) > EMA(26)
-buyScore += ema12 > ema26 ? 1 : 0
+wBuyScore += ema12 > ema26 ? wTrendEma : 0.0
+wBuyMax   += wTrendEma
 
 // Trend: Price > SMA(200)
-buyScore += (sma200 > 0 and close > sma200) ? 1 : 0
+wBuyScore += (sma200 > 0 and close > sma200) ? wTrendSma200 : 0.0
+wBuyMax   += wTrendSma200
 
-// Trend: Ichimoku — price above cloud
-buyScore += priceAboveCloud ? 1 : 0
+// Trend: Ichimoku price above cloud
+wBuyScore += priceAboveCloud ? wTrendIchi : 0.0
+wBuyMax   += wTrendIchi
 
-// Momentum: RSI crosses above 30 (oversold recovery)
-buyScore += (rsiVal > 30 and prevRSI <= 30) ? 1 : 0
+// Momentum: RSI oversold recovery
+wBuyScore += (rsiVal > 30 and prevRSI <= 30) ? wMomRsi : 0.0
+wBuyMax   += wMomRsi
 
 // Momentum: MACD bullish crossover
-buyScore += (macdLine > macdSig and macdLine[1] <= macdSig[1]) ? 1 : 0
+wBuyScore += (macdLine > macdSig and macdLine[1] <= macdSig[1]) ? wMomMacd : 0.0
+wBuyMax   += wMomMacd
 
-// Momentum: Stochastic %K crosses above %D from oversold
-buyScore += (stochK < 30 and stochK > stochD and stochK[1] <= stochD[1]) ? 1 : 0
+// Momentum: Stochastic crossover from oversold
+wBuyScore += (stochK < 30 and stochK > stochD and stochK[1] <= stochD[1]) ? wMomStoch : 0.0
+wBuyMax   += wMomStoch
 
 // Volume: OBV rising
-buyScore += obvRising ? 1 : 0
+wBuyScore += obvRising ? wVolObv : 0.0
+wBuyMax   += wVolObv
 
-// Volume: MFI oversold and recovering
-buyScore += (mfiVal < 30 and mfiVal > mfiVal[1]) ? 1 : 0
+// Volume: MFI oversold recovery
+wBuyScore += (mfiVal < 30 and mfiVal > mfiVal[1]) ? wVolMfi : 0.0
+wBuyMax   += wVolMfi
 
-// --- Sell Score (8 factors) ---
-sellScore = 0
+float wBuyPct = wBuyMax > 0 ? (wBuyScore / wBuyMax) * 100 : 0.0
+
+// --- Weighted Sell Score ---
+float wSellScore = 0.0
+float wSellMax   = 0.0
 
 // Trend: EMA(12) < EMA(26)
-sellScore += ema12 < ema26 ? 1 : 0
+wSellScore += ema12 < ema26 ? wTrendEma : 0.0
+wSellMax   += wTrendEma
 
 // Trend: Price < SMA(200)
-sellScore += (sma200 > 0 and close < sma200) ? 1 : 0
+wSellScore += (sma200 > 0 and close < sma200) ? wTrendSma200 : 0.0
+wSellMax   += wTrendSma200
 
-// Trend: Ichimoku — price below cloud
-sellScore += (not priceAboveCloud and spanA > 0) ? 1 : 0
+// Trend: Ichimoku price below cloud
+wSellScore += priceBelowCloud ? wTrendIchi : 0.0
+wSellMax   += wTrendIchi
 
-// Momentum: RSI crosses below 70 (overbought pullback)
-sellScore += (rsiVal < 70 and prevRSI >= 70) ? 1 : 0
+// Momentum: RSI overbought pullback
+wSellScore += (rsiVal < 70 and prevRSI >= 70) ? wMomRsi : 0.0
+wSellMax   += wMomRsi
 
 // Momentum: MACD bearish crossover
-sellScore += (macdLine < macdSig and macdLine[1] >= macdSig[1]) ? 1 : 0
+wSellScore += (macdLine < macdSig and macdLine[1] >= macdSig[1]) ? wMomMacd : 0.0
+wSellMax   += wMomMacd
 
-// Momentum: Stochastic %K crosses below %D from overbought
-sellScore += (stochK > 70 and stochK < stochD and stochK[1] >= stochD[1]) ? 1 : 0
+// Momentum: Stochastic crossover from overbought
+wSellScore += (stochK > 70 and stochK < stochD and stochK[1] >= stochD[1]) ? wMomStoch : 0.0
+wSellMax   += wMomStoch
 
 // Volume: OBV falling
-sellScore += not obvRising ? 1 : 0
+wSellScore += not obvRising ? wVolObv : 0.0
+wSellMax   += wVolObv
 
-// Volume: MFI overbought and declining
-sellScore += (mfiVal > 70 and mfiVal < mfiVal[1]) ? 1 : 0
+// Volume: MFI overbought declining
+wSellScore += (mfiVal > 70 and mfiVal < mfiVal[1]) ? wVolMfi : 0.0
+wSellMax   += wVolMfi
 
-multiBuy  = buyScore >= multiBuyThresh and buyScore > sellScore
-multiSell = sellScore >= multiSellThresh and sellScore > buyScore
+float wSellPct = wSellMax > 0 ? (wSellScore / wSellMax) * 100 : 0.0
 
-// ─────────────────────────────────────────────────────────────────────────────
-// STRATEGY ROUTER — select active strategy signals
-// ─────────────────────────────────────────────────────────────────────────────
+multiBuy  = wBuyPct >= multiBuyThreshPct and wBuyPct > wSellPct
+multiSell = wSellPct >= multiSellThreshPct and wSellPct > wBuyPct
+
+// ---------------------------------------------------------------------------
+// STRATEGY ROUTER
+// ---------------------------------------------------------------------------
 
 bool isBuy  = false
 bool isSell = false
@@ -337,317 +375,153 @@ switch strategyChoice
         isBuy  := multiBuy
         isSell := multiSell
 
-// ─────────────────────────────────────────────────────────────────────────────
-// STRATEGY EXECUTION
-// ─────────────────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// TRADE FILTERS
+// ---------------------------------------------------------------------------
 
-if isBuy
-    strategy.entry("Long", strategy.long)
+// Trend alignment: only calls above EMA200, puts below EMA200
+bool trendAllowsLong  = not useTrendFilter or (close > ema200)
+bool trendAllowsShort = not useTrendFilter or (close < ema200)
 
-if isSell
-    strategy.close("Long")
+// Volume confirmation: require at least average volume
+bool volumeConfirmed = not useVolFilter or (avgVol20 > 0 and volume >= avgVol20 * volFilterMult)
 
-// ─────────────────────────────────────────────────────────────────────────────
-// CONFLUENCE SIGNAL GENERATOR
-// Scores all indicators across 4 dimensions, matching SignalGenerator.java
-// ─────────────────────────────────────────────────────────────────────────────
-
-bullishCount = 0
-bearishCount = 0
-
-// --- TREND ---
-// EMA(12) vs EMA(26)
-bullishCount += ema12 > ema26 ? 1 : 0
-bearishCount += ema12 < ema26 ? 1 : 0
-
-// Price vs SMA(200)
-if sma200 > 0
-    bullishCount += close > sma200 ? 1 : 0
-    bearishCount += close < sma200 ? 1 : 0
-
-// Golden / Death Cross
-bullishCount += (sma50 > sma200 and sma50[1] <= sma200[1]) ? 1 : 0
-bearishCount += (sma50 < sma200 and sma50[1] >= sma200[1]) ? 1 : 0
-
-// Ichimoku Cloud
-if spanA > 0
-    bullishCount += priceAboveCloud ? 1 : 0
-    bearishCount += not priceAboveCloud ? 1 : 0
-
-// Ichimoku TK Cross
-bullishCount += (tenkan > kijun and tenkan[1] <= kijun[1]) ? 1 : 0
-bearishCount += (tenkan < kijun and tenkan[1] >= kijun[1]) ? 1 : 0
-
-// Parabolic SAR flip
-bullishCount += (sarBullish and not sarBullish[1]) ? 1 : 0
-bearishCount += (not sarBullish and sarBullish[1]) ? 1 : 0
-
-// ADX trend strength with DI direction
-if adxVal > 25
-    bullishCount += diPlus > diMinus ? 1 : 0
-    bearishCount += diMinus > diPlus ? 1 : 0
-
-// --- MOMENTUM ---
-// RSI
-bullishCount += (rsiVal > 30 and prevRSI <= 30) ? 1 : 0
-bearishCount += (rsiVal < 70 and prevRSI >= 70) ? 1 : 0
-bullishCount += rsiVal < 30 ? 1 : 0
-bearishCount += rsiVal > 70 ? 1 : 0
-
-// MACD crossover
-bullishCount += (macdLine > macdSig and macdLine[1] <= macdSig[1]) ? 1 : 0
-bearishCount += (macdLine < macdSig and macdLine[1] >= macdSig[1]) ? 1 : 0
-
-// MACD histogram expanding
-bullishCount += (macdHist > 0 and macdHist > macdHist[1]) ? 1 : 0
-bearishCount += (macdHist < 0 and macdHist < macdHist[1]) ? 1 : 0
-
-// Stochastic
-bullishCount += stochK < 20 ? 1 : 0
-bearishCount += stochK > 80 ? 1 : 0
-
-// Williams %R
-bullishCount += williamsR < -80 ? 1 : 0
-bearishCount += williamsR > -20 ? 1 : 0
-
-// CCI
-bullishCount += cciVal < -100 ? 1 : 0
-bearishCount += cciVal > 100 ? 1 : 0
-
-// ROC
-bullishCount += (rocVal > 0 and rocVal[1] <= 0) ? 1 : 0
-bearishCount += (rocVal < 0 and rocVal[1] >= 0) ? 1 : 0
-
-// --- VOLUME ---
-// OBV
-bullishCount += obvRising ? 1 : 0
-bearishCount += not obvRising ? 1 : 0
-
-// MFI
-bullishCount += mfiVal < 20 ? 1 : 0
-bearishCount += mfiVal > 80 ? 1 : 0
-
-// Volume vs average
-if avgVol20 > 0 and volume > avgVol20 * 1.5
-    bullishCount += close > close[1] ? 1 : 0
-    bearishCount += close < close[1] ? 1 : 0
-
-// --- VOLATILITY ---
-// Bollinger %B
-bullishCount += bbPctB <= 0 ? 1 : 0
-bearishCount += bbPctB >= 1 ? 1 : 0
-
-// Price vs VWAP
-if vwapVal > 0
-    bullishCount += close > vwapVal ? 1 : 0
-    bearishCount += close < vwapVal ? 1 : 0
-
-// Confluence signal classification
-totalIndicators = math.max(bullishCount + bearishCount, 1)
-bullishPct = bullishCount / totalIndicators
-bearishPct = bearishCount / totalIndicators
-
-string signalDir = "NEUTRAL"
-float  confluenceScore = 0.0
-
-if bullishPct >= 0.75
-    signalDir := "STRONG BUY"
-    confluenceScore := bullishPct
-else if bullishPct >= 0.55
-    signalDir := "BUY"
-    confluenceScore := bullishPct
-else if bearishPct >= 0.75
-    signalDir := "STRONG SELL"
-    confluenceScore := bearishPct
-else if bearishPct >= 0.55
-    signalDir := "SELL"
-    confluenceScore := bearishPct
+// Cooldown: prevent whipsaws after exit
+var int barsSinceExit = 100
+if strategy.position_size == 0 and strategy.position_size[1] != 0
+    barsSinceExit := 0
 else
-    signalDir := "NEUTRAL"
-    confluenceScore := math.max(bullishPct, bearishPct)
+    barsSinceExit += 1
+bool cooldownClear = barsSinceExit >= cooldownBars
 
-// ─────────────────────────────────────────────────────────────────────────────
-// VISUAL OVERLAYS
-// ─────────────────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// FILTERED ENTRY SIGNALS
+// ---------------------------------------------------------------------------
 
-// === Moving Averages ===
-plot(sma50, "SMA 50", color=color.new(color.blue, 40), linewidth=1)
-plot(sma200, "SMA 200", color=color.new(color.red, 40), linewidth=1)
+bool callEntry = isBuy  and trendAllowsLong  and volumeConfirmed and cooldownClear
+bool putEntry  = isSell and trendAllowsShort and volumeConfirmed and cooldownClear and enableShorts
 
-// === Bollinger Bands (optional) ===
-plot(showBBOverlay ? bbUpper : na, "BB Upper", color=color.new(color.gray, 60), linewidth=1)
-plot(showBBOverlay ? bbBasis : na, "BB Middle", color=color.new(color.gray, 75), linewidth=1, style=plot.style_circles)
-plot(showBBOverlay ? bbLower : na, "BB Lower", color=color.new(color.gray, 60), linewidth=1)
-fill(plot(showBBOverlay ? bbUpper : na, display=display.none), plot(showBBOverlay ? bbLower : na, display=display.none),
-     color=color.new(color.gray, 92), title="BB Fill")
+// ---------------------------------------------------------------------------
+// POSITION SIZING (risk-based)
+// ---------------------------------------------------------------------------
 
-// === Ichimoku Cloud (optional) ===
-pSpanA = plot(showIchimoku ? spanA : na, "Span A", color=color.new(color.green, 70), offset=26)
-pSpanB = plot(showIchimoku ? spanB : na, "Span B", color=color.new(color.red, 70), offset=26)
-fill(pSpanA, pSpanB, color=spanA >= spanB ? color.new(color.green, 90) : color.new(color.red, 90), title="Ichimoku Cloud")
-plot(showIchimoku ? tenkan : na, "Tenkan", color=color.new(color.blue, 50), linewidth=1)
-plot(showIchimoku ? kijun : na, "Kijun", color=color.new(color.maroon, 50), linewidth=1)
+float stopDistance = atrVal * slMultiplier
+float riskAmount  = strategy.equity * (riskPerTrade / 100.0)
+float posSize     = stopDistance > 0 ? riskAmount / stopDistance : na
 
-// === Parabolic SAR (optional) ===
-plot(showSAROverlay ? sarVal : na, "Parabolic SAR", color=sarBullish ? color.new(color.green, 30) : color.new(color.red, 30),
-     style=plot.style_circles, linewidth=1)
+// ---------------------------------------------------------------------------
+// STOP-LOSS & TAKE-PROFIT TRACKING
+// ---------------------------------------------------------------------------
 
-// === Buy / Sell markers ===
-plotshape(isBuy, title="Buy Signal", location=location.belowbar, style=shape.triangleup,
-     size=size.small, color=color.new(color.green, 0), text="BUY")
-plotshape(isSell, title="Sell Signal", location=location.abovebar, style=shape.triangledown,
-     size=size.small, color=color.new(color.red, 0), text="SELL")
+var float entryPrice  = na
+var float stopLevel   = na
+var float targetLevel = na
+var float trailStop   = na
+var float entryATR    = na
 
-// === Background tint based on confluence ===
-bgColor = signalDir == "STRONG BUY"  ? color.new(color.green, 90) :
-          signalDir == "BUY"          ? color.new(color.green, 95) :
-          signalDir == "STRONG SELL"  ? color.new(color.red, 90) :
-          signalDir == "SELL"         ? color.new(color.red, 95) :
-          color.new(color.gray, 98)
-bgcolor(bgColor, title="Confluence Background")
+// Detect new long entry
+if strategy.position_size > 0 and strategy.position_size[1] <= 0
+    entryPrice  := strategy.opentrades.entry_price(strategy.opentrades - 1)
+    entryATR    := atrVal
+    stopLevel   := entryPrice - atrVal * slMultiplier
+    targetLevel := entryPrice + atrVal * tpMultiplier
+    trailStop   := na
 
-// ─────────────────────────────────────────────────────────────────────────────
-// SUPPORT & RESISTANCE (Swing Highs/Lows)
-// ─────────────────────────────────────────────────────────────────────────────
+// Detect new short entry
+if strategy.position_size < 0 and strategy.position_size[1] >= 0
+    entryPrice  := strategy.opentrades.entry_price(strategy.opentrades - 1)
+    entryATR    := atrVal
+    stopLevel   := entryPrice + atrVal * slMultiplier
+    targetLevel := entryPrice - atrVal * tpMultiplier
+    trailStop   := na
 
-swingLen = 5
-swingHigh = ta.pivothigh(high, swingLen, swingLen)
-swingLow  = ta.pivotlow(low, swingLen, swingLen)
+// ---------------------------------------------------------------------------
+// TRAILING STOP MANAGEMENT
+// ---------------------------------------------------------------------------
 
-if showSR and not na(swingHigh)
-    line.new(bar_index - swingLen, swingHigh, bar_index, swingHigh,
-         color=color.new(color.red, 50), style=line.style_dotted, width=1, extend=extend.right)
+if useTrailingStop and strategy.position_size > 0 and not na(entryPrice) and not na(entryATR)
+    float moveFromEntry = close - entryPrice
+    float activationDist = entryATR * trailActivation
+    if moveFromEntry >= activationDist
+        float candidateTrail = close - atrVal * trailATRMult
+        if na(trailStop) or candidateTrail > trailStop
+            trailStop := candidateTrail
+        if not na(trailStop) and trailStop > stopLevel
+            stopLevel := trailStop
 
-if showSR and not na(swingLow)
-    line.new(bar_index - swingLen, swingLow, bar_index, swingLow,
-         color=color.new(color.green, 50), style=line.style_dotted, width=1, extend=extend.right)
+if useTrailingStop and strategy.position_size < 0 and not na(entryPrice) and not na(entryATR)
+    float moveFromEntry = entryPrice - close
+    float activationDist = entryATR * trailActivation
+    if moveFromEntry >= activationDist
+        float candidateTrail = close + atrVal * trailATRMult
+        if na(trailStop) or candidateTrail < trailStop
+            trailStop := candidateTrail
+        if not na(trailStop) and trailStop < stopLevel
+            stopLevel := trailStop
 
-// ─────────────────────────────────────────────────────────────────────────────
-// ALERTS
-// ─────────────────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// STRATEGY EXECUTION -- CALL (Long) & PUT (Short)
+// ---------------------------------------------------------------------------
 
-alertcondition(isBuy, title="Buy Alert", message="{{ticker}} — BUY signal from {{strategy.order.action}} strategy")
-alertcondition(isSell, title="Sell Alert", message="{{ticker}} — SELL signal from {{strategy.order.action}} strategy")
-alertcondition(signalDir == "STRONG BUY", title="Strong Buy Confluence",
-     message="{{ticker}} — STRONG BUY confluence detected (75%+ bullish indicators)")
-alertcondition(signalDir == "STRONG SELL", title="Strong Sell Confluence",
-     message="{{ticker}} — STRONG SELL confluence detected (75%+ bearish indicators)")
+// --- CALL ENTRY ---
+if callEntry and strategy.position_size == 0
+    strategy.entry("Call Entry", strategy.long, qty=posSize)
+    alert("CALL ENTRY: " + syminfo.tickerid + " @ " + str.tostring(close, "#.##") +
+          " | Stop: " + str.tostring(close - stopDistance, "#.##") +
+          " | Target: " + str.tostring(close + atrVal * tpMultiplier, "#.##"),
+          alert.freq_once_per_bar)
 
-// ─────────────────────────────────────────────────────────────────────────────
-// CONFLUENCE DASHBOARD TABLE
-// ─────────────────────────────────────────────────────────────────────────────
+// --- PUT ENTRY ---
+if putEntry and strategy.position_size == 0
+    strategy.entry("Put Entry", strategy.short, qty=posSize)
+    alert("PUT ENTRY: " + syminfo.tickerid + " @ " + str.tostring(close, "#.##") +
+          " | Stop: " + str.tostring(close + stopDistance, "#.##") +
+          " | Target: " + str.tostring(close - atrVal * tpMultiplier, "#.##"),
+          alert.freq_once_per_bar)
 
-if showDashboard and barstate.islast
-    var table dashboard = table.new(position.top_right, 2, 18,
-         bgcolor=color.new(color.black, 15), border_width=1, border_color=color.gray,
-         frame_width=1, frame_color=color.gray)
+// --- CALL EXIT (signal-based) ---
+if strategy.position_size > 0 and isSell
+    strategy.close("Call Entry", comment="Call Signal Exit")
+    alert("CALL EXIT (Signal): " + syminfo.tickerid + " @ " + str.tostring(close, "#.##"),
+          alert.freq_once_per_bar)
 
-    headerBg = color.new(#1a1a2e, 0)
-    textCol  = color.white
+// --- PUT EXIT (signal-based) ---
+if strategy.position_size < 0 and isBuy
+    strategy.close("Put Entry", comment="Put Signal Exit")
+    alert("PUT EXIT (Signal): " + syminfo.tickerid + " @ " + str.tostring(close, "#.##"),
+          alert.freq_once_per_bar)
 
-    // Signal color
-    sigColor = signalDir == "STRONG BUY"  ? color.lime :
-               signalDir == "BUY"          ? color.green :
-               signalDir == "STRONG SELL"  ? color.red :
-               signalDir == "SELL"         ? #ff6666 :
-               color.gray
+// --- ATR-based stop-loss and take-profit exits ---
+if strategy.position_size > 0 and not na(stopLevel) and not na(targetLevel)
+    strategy.exit("Call SL/TP", "Call Entry",
+         stop=stopLevel, limit=targetLevel,
+         comment_loss="Call Stop Loss", comment_profit="Call Take Profit")
 
-    // Header
-    table.cell(dashboard, 0, 0, "Stock Downloader", text_color=textCol, bgcolor=headerBg,
-         text_size=size.small, text_halign=text.align_left)
-    table.cell(dashboard, 1, 0, strategyChoice, text_color=color.yellow, bgcolor=headerBg,
-         text_size=size.small, text_halign=text.align_right)
-    table.merge_cells(dashboard, 0, 0, 1, 0)
+if strategy.position_size < 0 and not na(stopLevel) and not na(targetLevel)
+    strategy.exit("Put SL/TP", "Put Entry",
+         stop=stopLevel, limit=targetLevel,
+         comment_loss="Put Stop Loss", comment_profit="Put Take Profit")
 
-    // Signal
-    table.cell(dashboard, 0, 1, "Signal", text_color=textCol, bgcolor=headerBg, text_size=size.small)
-    table.cell(dashboard, 1, 1, signalDir + " (" + str.tostring(confluenceScore * 100, "#.0") + "%)",
-         text_color=sigColor, bgcolor=headerBg, text_size=size.small)
+// ---------------------------------------------------------------------------
+// MINIMAL VISUALS (strategy tester only)
+// ---------------------------------------------------------------------------
 
-    // Confluence
-    table.cell(dashboard, 0, 2, "Bullish / Bearish", text_color=textCol, bgcolor=headerBg, text_size=size.small)
-    table.cell(dashboard, 1, 2, str.tostring(bullishCount) + " / " + str.tostring(bearishCount),
-         text_color=textCol, bgcolor=headerBg, text_size=size.small)
+// Entry/exit markers
+plotshape(callEntry and strategy.position_size[1] <= 0, title="Call Entry",
+     location=location.belowbar, style=shape.triangleup,
+     size=size.small, color=color.new(color.green, 0), text="CALL")
+plotshape(putEntry and strategy.position_size[1] >= 0, title="Put Entry",
+     location=location.abovebar, style=shape.triangledown,
+     size=size.small, color=color.new(color.red, 0), text="PUT")
 
-    // Multi-Indicator Score
-    table.cell(dashboard, 0, 3, "Multi Score B/S", text_color=textCol, bgcolor=headerBg, text_size=size.small)
-    table.cell(dashboard, 1, 3, str.tostring(buyScore) + " / " + str.tostring(sellScore),
-         text_color=buyScore > sellScore ? color.green : buyScore < sellScore ? color.red : color.gray,
-         bgcolor=headerBg, text_size=size.small)
-
-    // Separator
-    sepBg = color.new(#2a2a4a, 0)
-    table.cell(dashboard, 0, 4, "— Trend —", text_color=color.yellow, bgcolor=sepBg,
-         text_size=size.tiny, text_halign=text.align_center)
-    table.merge_cells(dashboard, 0, 4, 1, 4)
-
-    // EMA 12/26
-    table.cell(dashboard, 0, 5, "EMA 12/26", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
-    table.cell(dashboard, 1, 5, ema12 > ema26 ? "Bullish" : "Bearish",
-         text_color=ema12 > ema26 ? color.green : color.red, bgcolor=headerBg, text_size=size.tiny)
-
-    // SMA 200
-    table.cell(dashboard, 0, 6, "SMA 200", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
-    table.cell(dashboard, 1, 6, close > sma200 ? "Above" : "Below",
-         text_color=close > sma200 ? color.green : color.red, bgcolor=headerBg, text_size=size.tiny)
-
-    // Ichimoku
-    table.cell(dashboard, 0, 7, "Ichimoku Cloud", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
-    table.cell(dashboard, 1, 7, priceAboveCloud ? "Above" : "Below",
-         text_color=priceAboveCloud ? color.green : color.red, bgcolor=headerBg, text_size=size.tiny)
-
-    // ADX
-    table.cell(dashboard, 0, 8, "ADX (" + str.tostring(adxVal, "#.1") + ")", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
-    adxLabel = adxVal > 25 ? (diPlus > diMinus ? "Strong Up" : "Strong Down") : "Weak/Range"
-    adxColor = adxVal > 25 ? (diPlus > diMinus ? color.green : color.red) : color.gray
-    table.cell(dashboard, 1, 8, adxLabel, text_color=adxColor, bgcolor=headerBg, text_size=size.tiny)
-
-    // Separator
-    table.cell(dashboard, 0, 9, "— Momentum —", text_color=color.yellow, bgcolor=sepBg,
-         text_size=size.tiny, text_halign=text.align_center)
-    table.merge_cells(dashboard, 0, 9, 1, 9)
-
-    // RSI
-    rsiColor = rsiVal < 30 ? color.green : rsiVal > 70 ? color.red : color.gray
-    table.cell(dashboard, 0, 10, "RSI (14)", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
-    table.cell(dashboard, 1, 10, str.tostring(rsiVal, "#.1"),
-         text_color=rsiColor, bgcolor=headerBg, text_size=size.tiny)
-
-    // MACD
-    macdColor = macdLine > macdSig ? color.green : color.red
-    table.cell(dashboard, 0, 11, "MACD", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
-    table.cell(dashboard, 1, 11, macdLine > macdSig ? "Bullish" : "Bearish",
-         text_color=macdColor, bgcolor=headerBg, text_size=size.tiny)
-
-    // Stochastic
-    stochColor = stochK < 20 ? color.green : stochK > 80 ? color.red : color.gray
-    table.cell(dashboard, 0, 12, "Stoch %K", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
-    table.cell(dashboard, 1, 12, str.tostring(stochK, "#.1"),
-         text_color=stochColor, bgcolor=headerBg, text_size=size.tiny)
-
-    // Separator
-    table.cell(dashboard, 0, 13, "— Volume —", text_color=color.yellow, bgcolor=sepBg,
-         text_size=size.tiny, text_halign=text.align_center)
-    table.merge_cells(dashboard, 0, 13, 1, 13)
-
-    // OBV
-    table.cell(dashboard, 0, 14, "OBV", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
-    table.cell(dashboard, 1, 14, obvRising ? "Rising" : "Falling",
-         text_color=obvRising ? color.green : color.red, bgcolor=headerBg, text_size=size.tiny)
-
-    // MFI
-    mfiColor = mfiVal < 20 ? color.green : mfiVal > 80 ? color.red : color.gray
-    table.cell(dashboard, 0, 15, "MFI (14)", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
-    table.cell(dashboard, 1, 15, str.tostring(mfiVal, "#.1"),
-         text_color=mfiColor, bgcolor=headerBg, text_size=size.tiny)
-
-    // Separator
-    table.cell(dashboard, 0, 16, "— Volatility —", text_color=color.yellow, bgcolor=sepBg,
-         text_size=size.tiny, text_halign=text.align_center)
-    table.merge_cells(dashboard, 0, 16, 1, 16)
-
-    // BB %B
-    bbColor = bbPctB <= 0 ? color.green : bbPctB >= 1 ? color.red : color.gray
-    table.cell(dashboard, 0, 17, "BB %B", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
-    table.cell(dashboard, 1, 17, str.tostring(bbPctB, "#.2") + (isSqueeze ? " [SQUEEZE]" : ""),
-         text_color=bbColor, bgcolor=headerBg, text_size=size.tiny)
+// Stop-loss and take-profit levels
+plot(strategy.position_size > 0 and not na(stopLevel) ? stopLevel : na,
+     "Long Stop", color=color.new(color.red, 30), style=plot.style_linebr, linewidth=1)
+plot(strategy.position_size > 0 and not na(targetLevel) ? targetLevel : na,
+     "Long Target", color=color.new(color.green, 30), style=plot.style_linebr, linewidth=1)
+plot(strategy.position_size < 0 and not na(stopLevel) ? stopLevel : na,
+     "Short Stop", color=color.new(color.red, 30), style=plot.style_linebr, linewidth=1)
+plot(strategy.position_size < 0 and not na(targetLevel) ? targetLevel : na,
+     "Short Target", color=color.new(color.green, 30), style=plot.style_linebr, linewidth=1)
+plot(strategy.position_size != 0 and not na(trailStop) ? trailStop : na,
+     "Trail Stop", color=color.new(color.orange, 30), style=plot.style_linebr, linewidth=1)
