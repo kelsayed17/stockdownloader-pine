@@ -1,0 +1,679 @@
+// This Pine Script source code is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+//
+// Stock Downloader ORB Strategy
+//
+// Opening Range Breakout (ORB) strategy with multi-filter confirmation
+// and credit spread trade signals for SPY options. Uses the 60-minute
+// opening range (9:30-10:30 AM ET) as the default breakout zone.
+//
+// Research Basis:
+//   - Swiss Finance Institute: ORB with filters achieves Sharpe ~2.81
+//   - Option Alpha backtests: 60-min ORB on SPY = 88.8% win rate
+//   - Unfiltered ORB = ~52% win rate; filtered = 60-85%
+//
+// Breakout Filters (all required by default):
+//   1. Candle CLOSE outside range (not just a wick touch)
+//   2. Relative volume >= 1.5x 20-bar average
+//   3. VWAP alignment with breakout direction
+//   4. Daily trend filter (price vs SMA 200 on daily chart)
+//
+// Credit Spread Signals ($10K account sizing):
+//   - Bullish breakout -> Sell put credit spread at OR low
+//   - Bearish breakout -> Sell call credit spread at OR high
+//   - $15-wide spreads, max $500 risk per trade (5% of account)
+//
+// Use with companion scripts:
+//   - stockdownloader_strategy.pine  (trading strategy)
+//   - stockdownloader_dashboard.pine (confluence scanner)
+//   - stockdownloader_overlay.pine   (visual indicators)
+//   - stockdownloader_wheel.pine     (wheel strategy timing)
+
+//@version=6
+indicator("StockDownloader ORB Strategy", overlay=true,
+     max_labels_count=500, max_lines_count=500)
+
+// ---------------------------------------------------------------------------
+// INPUTS
+// ---------------------------------------------------------------------------
+
+string ORB_GROUP    = "Opening Range Settings"
+string FILTER_GROUP = "Breakout Filters"
+string SPREAD_GROUP = "Credit Spread Settings"
+string DAILY_GROUP  = "Daily Trend Filter"
+string VIS_GROUP    = "Display Settings"
+
+// Opening Range
+orbMinutes = input.int(60, "Opening Range Duration (minutes)", minval=5, maxval=120, step=5,
+     group=ORB_GROUP,
+     tooltip="Duration of the opening range in minutes from market open.\n" +
+             "60 = 9:30-10:30 AM ET (recommended for SPY).\n" +
+             "15 and 30 are also common but show higher drawdowns.")
+orbSessionStart = input.session("0930-1600", "Market Session (ET)",
+     group=ORB_GROUP,
+     tooltip="Regular trading hours in Eastern Time.\n" +
+             "The opening range starts at the beginning of this session.")
+orbTimezone = input.string("America/New_York", "Timezone",
+     options=["America/New_York", "America/Chicago", "America/Denver", "America/Los_Angeles"],
+     group=ORB_GROUP,
+     tooltip="Timezone for session calculations. Use America/New_York for ET.")
+orbExtendLines = input.bool(true, "Extend OR Lines Through Session",
+     group=ORB_GROUP,
+     tooltip="Extend the opening range high/low lines for the rest of the trading day.")
+maxBreakoutsPerDay = input.int(1, "Max Signals Per Day", minval=1, maxval=5,
+     group=ORB_GROUP,
+     tooltip="Maximum number of breakout signals to generate per trading day.\n" +
+             "1 = only trade the first confirmed breakout (recommended).")
+
+// Breakout Filters
+useCloseFilter = input.bool(true, "Require Candle Close Outside Range",
+     group=FILTER_GROUP,
+     tooltip="Only signal when a candle CLOSES outside the opening range,\n" +
+             "not just wicks through it. Eliminates most false breakouts.")
+useVolumeFilter = input.bool(true, "Require Volume Confirmation",
+     group=FILTER_GROUP,
+     tooltip="Require relative volume above threshold to confirm breakout.\n" +
+             "Low-volume breakouts have much higher failure rates.")
+volMultiplier = input.float(1.5, "Min Relative Volume (x avg)", minval=0.5, maxval=5.0, step=0.1,
+     group=FILTER_GROUP,
+     tooltip="Breakout bar volume must be >= this multiple of the 20-bar average volume.\n" +
+             "1.5x is the standard threshold from academic research.")
+volAvgPeriod = input.int(20, "Volume Average Period", minval=5, maxval=100,
+     group=FILTER_GROUP,
+     tooltip="Period for calculating average volume baseline.")
+useVwapFilter = input.bool(true, "Require VWAP Alignment",
+     group=FILTER_GROUP,
+     tooltip="Bullish breakout requires price above VWAP.\n" +
+             "Bearish breakout requires price below VWAP.\n" +
+             "Ensures institutional flow agrees with breakout direction.")
+useTrendFilter = input.bool(true, "Require Daily Trend Alignment",
+     group=FILTER_GROUP,
+     tooltip="Bullish breakout requires price above daily SMA 200.\n" +
+             "Bearish breakout requires price below daily SMA 200.\n" +
+             "Trading with the trend dramatically improves win rates.")
+
+// Credit Spread Settings
+accountSize = input.float(10000, "Account Size ($)", minval=1000, step=1000,
+     group=SPREAD_GROUP,
+     tooltip="Total account size for position sizing calculations.")
+spreadWidth = input.float(15, "Spread Width ($)", minval=1, maxval=50, step=1,
+     group=SPREAD_GROUP,
+     tooltip="Width of the credit spread in dollars.\n" +
+             "$15 is recommended for SPY spreads.")
+maxRiskPct = input.float(5.0, "Max Risk Per Trade (%)", minval=1, maxval=20, step=0.5,
+     group=SPREAD_GROUP,
+     tooltip="Maximum percentage of account to risk per trade.\n" +
+             "5% of $10K = $500 max risk.")
+showSpreadLevels = input.bool(true, "Show Spread Strike Levels",
+     group=SPREAD_GROUP,
+     tooltip="Display suggested short and long strike levels on chart.")
+
+// Daily Trend Filter
+dailySmaLen = input.int(200, "Daily SMA Length", minval=10, maxval=500,
+     group=DAILY_GROUP,
+     tooltip="SMA period on the daily chart for trend determination.")
+dailyEmaTrendLen = input.int(50, "Daily EMA Trend Length", minval=10, maxval=200,
+     group=DAILY_GROUP,
+     tooltip="EMA period on daily chart. Used as secondary trend confirmation.")
+
+// Display Settings
+showDashboard = input.bool(true, "Show ORB Dashboard", group=VIS_GROUP)
+showSignalLabels = input.bool(true, "Show Breakout Signal Labels", group=VIS_GROUP)
+showBgTint = input.bool(true, "Show Background Tint on Signals", group=VIS_GROUP)
+showORRange = input.bool(true, "Show Opening Range Shading", group=VIS_GROUP)
+orbHighColor = input.color(color.new(#26a69a, 70), "OR High Line Color", group=VIS_GROUP)
+orbLowColor = input.color(color.new(#ef5350, 70), "OR Low Line Color", group=VIS_GROUP)
+orbFillColor = input.color(color.new(#2196f3, 90), "OR Range Fill Color", group=VIS_GROUP)
+
+// ---------------------------------------------------------------------------
+// SESSION & TIME CALCULATIONS
+// ---------------------------------------------------------------------------
+
+// Determine if we are inside the market session
+inSession = not na(time(timeframe.period, orbSessionStart, orbTimezone))
+
+// Calculate the end of the opening range period
+// We detect the session start bar and count minutes forward
+var int sessionStartTime = na
+var bool orbPeriodActive = false
+var bool orbEstablished  = false
+var int  todaySignalCount = 0
+
+// Detect new session (first bar of the trading session)
+isNewSession = inSession and not inSession[1]
+
+if isNewSession
+    sessionStartTime := time
+    orbPeriodActive  := true
+    orbEstablished   := false
+    todaySignalCount := 0
+
+// Opening range period: from session start to orbMinutes later
+orbEndTime = sessionStartTime + orbMinutes * 60 * 1000  // Convert minutes to milliseconds
+if orbPeriodActive and time >= orbEndTime
+    orbPeriodActive := false
+    orbEstablished  := true
+
+// Detect end of session (for resetting)
+isSessionEnd = not inSession and inSession[1]
+
+// ---------------------------------------------------------------------------
+// OPENING RANGE TRACKING
+// ---------------------------------------------------------------------------
+
+var float orbHigh = na
+var float orbLow  = na
+var float orbMid  = na
+
+// Reset at new session
+if isNewSession
+    orbHigh := high
+    orbLow  := low
+
+// Track high/low during opening range period
+if orbPeriodActive
+    orbHigh := math.max(nz(orbHigh, high), high)
+    orbLow  := math.min(nz(orbLow, low), low)
+
+// Calculate midpoint once range is established
+if orbEstablished and na(orbMid)
+    orbMid := (orbHigh + orbLow) / 2.0
+
+// Opening range size
+float orbRange = orbEstablished ? orbHigh - orbLow : na
+
+// ---------------------------------------------------------------------------
+// TECHNICAL INDICATORS
+// ---------------------------------------------------------------------------
+
+// VWAP (intraday only)
+vwapVal = ta.vwap(hlc3)
+
+// Volume
+avgVol = ta.sma(volume, volAvgPeriod)
+relativeVol = avgVol > 0 ? volume / avgVol : 0.0
+
+// RSI (for additional context)
+rsiVal = ta.rsi(close, 14)
+
+// ATR
+atrVal = ta.atr(14)
+
+// Daily trend data (using request.security for daily timeframe)
+dailySma = request.security(syminfo.tickerid, "D", ta.sma(close, dailySmaLen), lookahead=barmerge.lookahead_on)
+dailyEma = request.security(syminfo.tickerid, "D", ta.ema(close, dailyEmaTrendLen), lookahead=barmerge.lookahead_on)
+dailyClose = request.security(syminfo.tickerid, "D", close, lookahead=barmerge.lookahead_on)
+
+// Daily trend determination
+bool dailyBullish = not na(dailySma) and dailyClose > dailySma
+bool dailyBearish = not na(dailySma) and dailyClose < dailySma
+
+// Secondary daily trend (EMA confirmation)
+bool dailyEmaBull = not na(dailyEma) and dailyClose > dailyEma
+bool dailyEmaBear = not na(dailyEma) and dailyClose < dailyEma
+
+// ---------------------------------------------------------------------------
+// BREAKOUT DETECTION
+// ---------------------------------------------------------------------------
+
+// Raw breakout conditions (price vs opening range)
+bool rawBullBreak = orbEstablished and not orbPeriodActive and inSession and close > orbHigh
+bool rawBearBreak = orbEstablished and not orbPeriodActive and inSession and close < orbLow
+
+// --- Filter 1: Candle Close Outside Range ---
+// If enabled, we require the candle to CLOSE outside the range, not just wick
+bool closeFilterBull = useCloseFilter ? close > orbHigh : (high > orbHigh)
+bool closeFilterBear = useCloseFilter ? close < orbLow  : (low < orbLow)
+
+// --- Filter 2: Volume Confirmation ---
+bool volumeConfirmed = useVolumeFilter ? relativeVol >= volMultiplier : true
+
+// --- Filter 3: VWAP Alignment ---
+bool vwapBullish = useVwapFilter ? close > vwapVal : true
+bool vwapBearish = useVwapFilter ? close < vwapVal : true
+
+// --- Filter 4: Daily Trend Alignment ---
+bool trendBullish = useTrendFilter ? dailyBullish : true
+bool trendBearish = useTrendFilter ? dailyBearish : true
+
+// Combined filtered breakout signals
+bool bullBreakout = rawBullBreak and closeFilterBull and volumeConfirmed and vwapBullish and trendBullish
+bool bearBreakout = rawBearBreak and closeFilterBear and volumeConfirmed and vwapBearish and trendBearish
+
+// Limit signals per day
+bool bullSignal = bullBreakout and todaySignalCount < maxBreakoutsPerDay
+bool bearSignal = bearBreakout and todaySignalCount < maxBreakoutsPerDay
+
+// Track signal count
+if (bullSignal or bearSignal) and barstate.isconfirmed
+    todaySignalCount += 1
+
+// Track first breakout direction for the day
+var int todayBreakoutDir = 0  // 0=none, 1=bull, -1=bear
+if isNewSession
+    todayBreakoutDir := 0
+if bullSignal and todayBreakoutDir == 0
+    todayBreakoutDir := 1
+if bearSignal and todayBreakoutDir == 0
+    todayBreakoutDir := -1
+
+// ---------------------------------------------------------------------------
+// BREAKOUT QUALITY SCORING
+// ---------------------------------------------------------------------------
+//
+// Score the quality of each breakout from 0-100 based on how many
+// confirming factors align. Higher scores = higher probability setups.
+//
+
+float breakoutScore = 0.0
+float breakoutMax   = 0.0
+
+// --- Factor 1: Candle Close Outside Range (0-20 points) ---
+breakoutMax += 20.0
+if close > orbHigh or close < orbLow
+    breakoutScore += 20.0
+else if high > orbHigh or low < orbLow
+    breakoutScore += 5.0   // Wick only = weak
+
+// --- Factor 2: Volume Surge (0-25 points) ---
+breakoutMax += 25.0
+if relativeVol >= 3.0
+    breakoutScore += 25.0   // Monster volume
+else if relativeVol >= 2.0
+    breakoutScore += 20.0   // Strong volume
+else if relativeVol >= 1.5
+    breakoutScore += 15.0   // Adequate volume
+else if relativeVol >= 1.0
+    breakoutScore += 5.0    // Below threshold
+
+// --- Factor 3: VWAP Alignment (0-20 points) ---
+breakoutMax += 20.0
+if (rawBullBreak and close > vwapVal) or (rawBearBreak and close < vwapVal)
+    breakoutScore += 20.0
+else if (rawBullBreak and close > vwapVal * 0.999) or (rawBearBreak and close < vwapVal * 1.001)
+    breakoutScore += 10.0   // Close to VWAP
+
+// --- Factor 4: Daily Trend Alignment (0-20 points) ---
+breakoutMax += 20.0
+if (rawBullBreak and dailyBullish) or (rawBearBreak and dailyBearish)
+    breakoutScore += 15.0
+    // Bonus for EMA confirmation
+    if (rawBullBreak and dailyEmaBull) or (rawBearBreak and dailyEmaBear)
+        breakoutScore += 5.0
+
+// --- Factor 5: Breakout Magnitude (0-15 points) ---
+// How far price has moved beyond the range
+breakoutMax += 15.0
+float breakoutDist = rawBullBreak ? (close - orbHigh) : rawBearBreak ? (orbLow - close) : 0.0
+float breakoutPct  = orbRange > 0 ? breakoutDist / orbRange * 100 : 0.0
+if breakoutPct >= 50
+    breakoutScore += 15.0   // Strong move beyond range
+else if breakoutPct >= 25
+    breakoutScore += 10.0
+else if breakoutPct >= 10
+    breakoutScore += 5.0
+
+// Normalize to 0-100
+float breakoutPctScore = breakoutMax > 0 ? (breakoutScore / breakoutMax) * 100 : 0.0
+
+// Quality classification
+string breakoutQuality = breakoutPctScore >= 80 ? "STRONG" :
+                          breakoutPctScore >= 60 ? "GOOD" :
+                          breakoutPctScore >= 40 ? "MODERATE" : "WEAK"
+
+// ---------------------------------------------------------------------------
+// CREDIT SPREAD CALCULATIONS
+// ---------------------------------------------------------------------------
+//
+// Bullish breakout (close above OR high):
+//   -> Sell put credit spread at OR low (short put) with long put $15 below
+//   -> Expectation: price stays above OR, spread expires worthless
+//
+// Bearish breakout (close below OR low):
+//   -> Sell call credit spread at OR high (short call) with long call $15 above
+//   -> Expectation: price stays below OR, spread expires worthless
+//
+
+float maxRiskDollars = accountSize * (maxRiskPct / 100)
+
+// Put credit spread levels (bullish breakout)
+float putShortStrike = orbLow                          // Sell put at OR low
+float putLongStrike  = orbLow - spreadWidth            // Buy put $15 below
+float putSpreadMaxLoss = spreadWidth * 100             // Max loss per contract (x100 multiplier)
+int   putContracts = putSpreadMaxLoss > 0 ? math.floor(maxRiskDollars / putSpreadMaxLoss) : 0
+
+// Call credit spread levels (bearish breakout)
+float callShortStrike = orbHigh                        // Sell call at OR high
+float callLongStrike  = orbHigh + spreadWidth          // Buy call $15 above
+float callSpreadMaxLoss = spreadWidth * 100
+int   callContracts = callSpreadMaxLoss > 0 ? math.floor(maxRiskDollars / callSpreadMaxLoss) : 0
+
+// Actual risk calculation
+float putActualRisk  = putContracts * putSpreadMaxLoss
+float callActualRisk = callContracts * callSpreadMaxLoss
+
+// ---------------------------------------------------------------------------
+// CHART VISUALS -- OPENING RANGE LINES
+// ---------------------------------------------------------------------------
+
+// Draw opening range high/low lines
+var line orbHighLine = na
+var line orbLowLine  = na
+var line orbMidLine  = na
+
+// Track the bar index where OR was established
+var int orbEstablishedBar = na
+if orbEstablished and na(orbEstablishedBar[1])
+    orbEstablishedBar := bar_index
+if isNewSession
+    orbEstablishedBar := na
+
+if showORRange
+    // Create new lines when OR is first established
+    if orbEstablished and na(orbEstablishedBar[1])
+        orbHighLine := line.new(bar_index - 1, orbHigh, bar_index, orbHigh,
+             color=orbHighColor, width=2, style=line.style_solid,
+             extend=orbExtendLines ? extend.right : extend.none)
+        orbLowLine := line.new(bar_index - 1, orbLow, bar_index, orbLow,
+             color=orbLowColor, width=2, style=line.style_solid,
+             extend=orbExtendLines ? extend.right : extend.none)
+        orbMidLine := line.new(bar_index - 1, orbMid, bar_index, orbMid,
+             color=color.new(color.gray, 60), width=1, style=line.style_dashed,
+             extend=orbExtendLines ? extend.right : extend.none)
+
+// Plot OR levels for fill
+float orbHighPlot = orbEstablished and inSession and showORRange ? orbHigh : na
+float orbLowPlot  = orbEstablished and inSession and showORRange ? orbLow : na
+
+p_orbHigh = plot(orbHighPlot, "OR High", color=color.new(orbHighColor, 100), display=display.none)
+p_orbLow  = plot(orbLowPlot, "OR Low", color=color.new(orbLowColor, 100), display=display.none)
+fill(p_orbHigh, p_orbLow, color=orbFillColor, title="OR Range Fill")
+
+// Plot VWAP for reference
+plot(inSession ? vwapVal : na, "VWAP", color=color.new(color.purple, 40),
+     style=plot.style_line, linewidth=1)
+
+// ---------------------------------------------------------------------------
+// CHART VISUALS -- CREDIT SPREAD STRIKE LEVELS
+// ---------------------------------------------------------------------------
+
+if showSpreadLevels and orbEstablished and inSession
+    // Show put spread levels on bullish breakout
+    if bullSignal and barstate.isconfirmed
+        // Short put strike (at OR low)
+        line.new(bar_index, putShortStrike, bar_index + 20, putShortStrike,
+             color=color.new(color.green, 30), width=2, style=line.style_dashed)
+        label.new(bar_index + 20, putShortStrike,
+             "Short Put " + str.tostring(putShortStrike, "#.##"),
+             style=label.style_label_left, color=color.new(color.green, 20),
+             textcolor=color.white, size=size.tiny)
+        // Long put strike
+        line.new(bar_index, putLongStrike, bar_index + 20, putLongStrike,
+             color=color.new(color.green, 60), width=1, style=line.style_dotted)
+        label.new(bar_index + 20, putLongStrike,
+             "Long Put " + str.tostring(putLongStrike, "#.##"),
+             style=label.style_label_left, color=color.new(color.green, 50),
+             textcolor=color.white, size=size.tiny)
+
+    // Show call spread levels on bearish breakout
+    if bearSignal and barstate.isconfirmed
+        // Short call strike (at OR high)
+        line.new(bar_index, callShortStrike, bar_index + 20, callShortStrike,
+             color=color.new(color.red, 30), width=2, style=line.style_dashed)
+        label.new(bar_index + 20, callShortStrike,
+             "Short Call " + str.tostring(callShortStrike, "#.##"),
+             style=label.style_label_left, color=color.new(color.red, 20),
+             textcolor=color.white, size=size.tiny)
+        // Long call strike
+        line.new(bar_index, callLongStrike, bar_index + 20, callLongStrike,
+             color=color.new(color.red, 60), width=1, style=line.style_dotted)
+        label.new(bar_index + 20, callLongStrike,
+             "Long Call " + str.tostring(callLongStrike, "#.##"),
+             style=label.style_label_left, color=color.new(color.red, 50),
+             textcolor=color.white, size=size.tiny)
+
+// ---------------------------------------------------------------------------
+// CHART VISUALS -- SIGNAL LABELS
+// ---------------------------------------------------------------------------
+
+if showSignalLabels
+    if bullSignal and barstate.isconfirmed
+        string bullText = "BULL ORB\nSELL PUT SPREAD\n" +
+             breakoutQuality + " (" + str.tostring(breakoutPctScore, "#.0") + ")\n" +
+             "Vol: " + str.tostring(relativeVol, "#.1") + "x"
+        color bullColor = breakoutPctScore >= 80 ? color.lime :
+                          breakoutPctScore >= 60 ? color.green : #4caf50
+        label.new(bar_index, low, bullText,
+             style=label.style_label_up, color=color.new(bullColor, 10),
+             textcolor=color.white, size=size.small)
+
+    if bearSignal and barstate.isconfirmed
+        string bearText = "BEAR ORB\nSELL CALL SPREAD\n" +
+             breakoutQuality + " (" + str.tostring(breakoutPctScore, "#.0") + ")\n" +
+             "Vol: " + str.tostring(relativeVol, "#.1") + "x"
+        color bearColor = breakoutPctScore >= 80 ? #ff1744 :
+                          breakoutPctScore >= 60 ? #ff4444 : #ff8888
+        label.new(bar_index, high, bearText,
+             style=label.style_label_down, color=color.new(bearColor, 10),
+             textcolor=color.white, size=size.small)
+
+// ---------------------------------------------------------------------------
+// CHART VISUALS -- BACKGROUND TINT
+// ---------------------------------------------------------------------------
+
+// Tint during opening range formation
+color orbFormingBg = orbPeriodActive and showBgTint ? color.new(color.blue, 95) : na
+bgcolor(orbFormingBg, title="OR Formation Period")
+
+// Tint on breakout signals
+color bullBg = bullSignal and showBgTint ? color.new(color.green, 90) : na
+color bearBg = bearSignal and showBgTint ? color.new(color.red, 90) : na
+bgcolor(bullBg, title="Bullish Breakout Background")
+bgcolor(bearBg, title="Bearish Breakout Background")
+
+// ---------------------------------------------------------------------------
+// ALERTS
+// ---------------------------------------------------------------------------
+
+alertcondition(bullSignal, title="Bullish ORB Breakout",
+     message="ORB: BULLISH breakout on {{ticker}} | " +
+             "Quality: " + breakoutQuality + " (" + str.tostring(breakoutPctScore, "#.0") + ") | " +
+             "Action: Sell put credit spread | " +
+             "Short strike: " + str.tostring(putShortStrike, "#.##") + " | " +
+             "Rel Volume: " + str.tostring(relativeVol, "#.1") + "x")
+
+alertcondition(bearSignal, title="Bearish ORB Breakout",
+     message="ORB: BEARISH breakout on {{ticker}} | " +
+             "Quality: " + breakoutQuality + " (" + str.tostring(breakoutPctScore, "#.0") + ") | " +
+             "Action: Sell call credit spread | " +
+             "Short strike: " + str.tostring(callShortStrike, "#.##") + " | " +
+             "Rel Volume: " + str.tostring(relativeVol, "#.1") + "x")
+
+alertcondition(bullSignal and breakoutPctScore >= 80, title="Strong Bullish ORB",
+     message="ORB: STRONG bullish breakout on {{ticker}} | Score: " +
+             str.tostring(breakoutPctScore, "#.0"))
+
+alertcondition(bearSignal and breakoutPctScore >= 80, title="Strong Bearish ORB",
+     message="ORB: STRONG bearish breakout on {{ticker}} | Score: " +
+             str.tostring(breakoutPctScore, "#.0"))
+
+alertcondition(orbEstablished and na(orbEstablishedBar[1]), title="Opening Range Established",
+     message="ORB: Opening range established on {{ticker}} | " +
+             "High: " + str.tostring(orbHigh, "#.##") + " | " +
+             "Low: " + str.tostring(orbLow, "#.##") + " | " +
+             "Range: " + str.tostring(orbRange, "#.##"))
+
+// ---------------------------------------------------------------------------
+// DASHBOARD TABLE
+// ---------------------------------------------------------------------------
+
+if showDashboard and barstate.islast
+    var table orb = table.new(position.top_right, 2, 26,
+         bgcolor=color.new(color.black, 15), border_width=1, border_color=color.gray,
+         frame_width=1, frame_color=color.gray)
+
+    headerBg = color.new(#1a1a2e, 0)
+    sepBg    = color.new(#2a2a4a, 0)
+    textCol  = color.white
+
+    // ---- Row 0: Title ----
+    table.cell(orb, 0, 0, "ORB Strategy", text_color=textCol, bgcolor=headerBg,
+         text_size=size.small, text_halign=text.align_center)
+    table.merge_cells(orb, 0, 0, 1, 0)
+
+    // ---- Row 1: OR Status ----
+    string orStatus = orbPeriodActive ? "FORMING" : orbEstablished ? "ESTABLISHED" : "WAITING"
+    color orStatusColor = orbPeriodActive ? color.yellow : orbEstablished ? color.green : color.gray
+    table.cell(orb, 0, 1, "OR Status", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(orb, 1, 1, orStatus, text_color=orStatusColor, bgcolor=headerBg, text_size=size.tiny)
+
+    // ---- Row 2: Opening Range Section ----
+    table.cell(orb, 0, 2, "--- Opening Range ---", text_color=color.yellow, bgcolor=sepBg,
+         text_size=size.tiny, text_halign=text.align_center)
+    table.merge_cells(orb, 0, 2, 1, 2)
+
+    // Row 3: OR High
+    table.cell(orb, 0, 3, "OR High", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(orb, 1, 3, not na(orbHigh) ? str.tostring(orbHigh, "#.##") : "---",
+         text_color=#26a69a, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 4: OR Low
+    table.cell(orb, 0, 4, "OR Low", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(orb, 1, 4, not na(orbLow) ? str.tostring(orbLow, "#.##") : "---",
+         text_color=#ef5350, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 5: OR Range
+    table.cell(orb, 0, 5, "OR Range", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(orb, 1, 5, not na(orbRange) ? str.tostring(orbRange, "#.##") : "---",
+         text_color=color.gray, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 6: OR Midpoint
+    table.cell(orb, 0, 6, "OR Midpoint", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(orb, 1, 6, not na(orbMid) ? str.tostring(orbMid, "#.##") : "---",
+         text_color=color.gray, bgcolor=headerBg, text_size=size.tiny)
+
+    // ---- Row 7: Filters Section ----
+    table.cell(orb, 0, 7, "--- Filter Status ---", text_color=color.yellow, bgcolor=sepBg,
+         text_size=size.tiny, text_halign=text.align_center)
+    table.merge_cells(orb, 0, 7, 1, 7)
+
+    // Row 8: Volume
+    string volStatus = relativeVol >= volMultiplier ? "PASS (" + str.tostring(relativeVol, "#.1") + "x)" :
+                       "FAIL (" + str.tostring(relativeVol, "#.1") + "x)"
+    color volColor = relativeVol >= volMultiplier ? color.green : color.red
+    table.cell(orb, 0, 8, "Volume (>=" + str.tostring(volMultiplier, "#.1") + "x)",
+         text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(orb, 1, 8, useVolumeFilter ? volStatus : "OFF",
+         text_color=useVolumeFilter ? volColor : color.gray, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 9: VWAP
+    string vwapStatus = close > vwapVal ? "ABOVE" : close < vwapVal ? "BELOW" : "AT VWAP"
+    color vwapColor = close > vwapVal ? color.green : close < vwapVal ? color.red : color.gray
+    table.cell(orb, 0, 9, "VWAP Position", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(orb, 1, 9, useVwapFilter ? vwapStatus : "OFF",
+         text_color=useVwapFilter ? vwapColor : color.gray, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 10: Daily Trend
+    string trendStatus = dailyBullish ? "BULLISH" : dailyBearish ? "BEARISH" : "NEUTRAL"
+    color trendColor = dailyBullish ? color.green : dailyBearish ? color.red : color.gray
+    table.cell(orb, 0, 10, "Daily Trend", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(orb, 1, 10, useTrendFilter ? trendStatus : "OFF",
+         text_color=useTrendFilter ? trendColor : color.gray, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 11: Price vs OR
+    string priceVsOR = not na(orbHigh) ?
+         (close > orbHigh ? "ABOVE OR" : close < orbLow ? "BELOW OR" : "INSIDE OR") : "---"
+    color priceVsORColor = not na(orbHigh) ?
+         (close > orbHigh ? color.green : close < orbLow ? color.red : color.yellow) : color.gray
+    table.cell(orb, 0, 11, "Price vs OR", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(orb, 1, 11, priceVsOR, text_color=priceVsORColor, bgcolor=headerBg, text_size=size.tiny)
+
+    // ---- Row 12: Signal Section ----
+    table.cell(orb, 0, 12, "--- Breakout Signal ---", text_color=color.yellow, bgcolor=sepBg,
+         text_size=size.tiny, text_halign=text.align_center)
+    table.merge_cells(orb, 0, 12, 1, 12)
+
+    // Row 13: Breakout Direction
+    string breakoutDir = todayBreakoutDir == 1 ? "BULLISH" :
+                         todayBreakoutDir == -1 ? "BEARISH" : "NONE"
+    color breakoutDirColor = todayBreakoutDir == 1 ? color.green :
+                             todayBreakoutDir == -1 ? color.red : color.gray
+    table.cell(orb, 0, 13, "Breakout", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(orb, 1, 13, breakoutDir, text_color=breakoutDirColor, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 14: Signal Quality
+    table.cell(orb, 0, 14, "Quality Score", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    color qualityColor = breakoutPctScore >= 80 ? color.lime :
+                         breakoutPctScore >= 60 ? color.green :
+                         breakoutPctScore >= 40 ? color.yellow : color.gray
+    table.cell(orb, 1, 14, todayBreakoutDir != 0 ?
+         str.tostring(breakoutPctScore, "#.0") + " (" + breakoutQuality + ")" : "---",
+         text_color=qualityColor, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 15: Signals Today
+    table.cell(orb, 0, 15, "Signals Today", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(orb, 1, 15, str.tostring(todaySignalCount) + " / " + str.tostring(maxBreakoutsPerDay),
+         text_color=color.gray, bgcolor=headerBg, text_size=size.tiny)
+
+    // ---- Row 16: Credit Spread Section ----
+    table.cell(orb, 0, 16, "--- Credit Spread ---", text_color=color.yellow, bgcolor=sepBg,
+         text_size=size.tiny, text_halign=text.align_center)
+    table.merge_cells(orb, 0, 16, 1, 16)
+
+    // Row 17: Recommended Trade
+    string tradeType = todayBreakoutDir == 1 ? "SELL PUT SPREAD" :
+                       todayBreakoutDir == -1 ? "SELL CALL SPREAD" : "WAIT"
+    color tradeColor = todayBreakoutDir != 0 ? color.yellow : color.gray
+    table.cell(orb, 0, 17, "Trade", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(orb, 1, 17, tradeType, text_color=tradeColor, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 18: Short Strike
+    string shortStrikeStr = todayBreakoutDir == 1 ? str.tostring(putShortStrike, "#.##") :
+                            todayBreakoutDir == -1 ? str.tostring(callShortStrike, "#.##") : "---"
+    table.cell(orb, 0, 18, "Short Strike", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(orb, 1, 18, shortStrikeStr,
+         text_color=todayBreakoutDir != 0 ? color.yellow : color.gray, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 19: Long Strike
+    string longStrikeStr = todayBreakoutDir == 1 ? str.tostring(putLongStrike, "#.##") :
+                           todayBreakoutDir == -1 ? str.tostring(callLongStrike, "#.##") : "---"
+    table.cell(orb, 0, 19, "Long Strike", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(orb, 1, 19, longStrikeStr,
+         text_color=todayBreakoutDir != 0 ? color.new(color.yellow, 30) : color.gray, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 20: Spread Width
+    table.cell(orb, 0, 20, "Spread Width", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(orb, 1, 20, "$" + str.tostring(spreadWidth, "#.00"),
+         text_color=color.gray, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 21: Contracts
+    int displayContracts = todayBreakoutDir == 1 ? putContracts :
+                           todayBreakoutDir == -1 ? callContracts : 0
+    table.cell(orb, 0, 21, "Contracts", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(orb, 1, 21, todayBreakoutDir != 0 ? str.tostring(displayContracts) : "---",
+         text_color=color.gray, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 22: Max Risk
+    float displayRisk = todayBreakoutDir == 1 ? putActualRisk :
+                        todayBreakoutDir == -1 ? callActualRisk : 0.0
+    table.cell(orb, 0, 22, "Max Risk", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(orb, 1, 22, todayBreakoutDir != 0 ?
+         "$" + str.tostring(displayRisk, "#.00") + " (" +
+         str.tostring(displayRisk / accountSize * 100, "#.1") + "%)" : "---",
+         text_color=todayBreakoutDir != 0 ? color.orange : color.gray, bgcolor=headerBg, text_size=size.tiny)
+
+    // ---- Row 23: Key Levels Section ----
+    table.cell(orb, 0, 23, "--- Key Levels ---", text_color=color.yellow, bgcolor=sepBg,
+         text_size=size.tiny, text_halign=text.align_center)
+    table.merge_cells(orb, 0, 23, 1, 23)
+
+    // Row 24: VWAP
+    table.cell(orb, 0, 24, "VWAP", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(orb, 1, 24, str.tostring(vwapVal, "#.##"),
+         text_color=color.purple, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 25: RSI
+    rsiColor = rsiVal < 30 ? color.green : rsiVal > 70 ? color.red : color.gray
+    table.cell(orb, 0, 25, "RSI (14)", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(orb, 1, 25, str.tostring(rsiVal, "#.1"),
+         text_color=rsiColor, bgcolor=headerBg, text_size=size.tiny)
