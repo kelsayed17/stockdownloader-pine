@@ -21,6 +21,7 @@
 //   - stockdownloader_strategy.pine  (trading strategy)
 //   - stockdownloader_dashboard.pine (confluence scanner)
 //   - stockdownloader_overlay.pine   (visual indicators)
+//   - stockdownloader_orb.pine       (opening range breakout)
 
 //@version=6
 indicator("StockDownloader Wheel Strategy", overlay=true,
