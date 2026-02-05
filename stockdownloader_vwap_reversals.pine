@@ -1,0 +1,1006 @@
+// This Pine Script source code is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+//
+// Stock Downloader VWAP Reversals Strategy
+//
+// This strategy focuses on trading reversals from the VWAP bands in sideways market conditions.
+// Designed for 5-minute charts on liquid assets.
+//
+// Strategy Logic:
+//   1. Skip the first hour (high volatility period)
+//   2. Confirm sideways market by observing band reversals during first hour
+//   3. Avoid trending markets where price hugs one band
+//   4. Sell at upper band with bearish candle confirmation
+//   5. Buy at lower band with bullish candle confirmation
+//   6. Target VWAP line with 1:1 risk/reward ratio
+//
+// VWAP Band Settings:
+//   - First band multiplier: 2 standard deviations
+//   - Second band multiplier: 3 standard deviations
+//
+// Entry Confirmation:
+//   - Bearish: Bearish hammer candles, small body red candles, strong red break
+//   - Bullish: Slowing momentum with small candles, followed by strong green candle
+//   - Support/Resistance confluence with VWAP bands
+//
+// Use with companion scripts:
+//   - stockdownloader_strategy.pine  (trading strategy)
+//   - stockdownloader_dashboard.pine (confluence scanner)
+//   - stockdownloader_overlay.pine   (visual indicators)
+//   - stockdownloader_vwap_pullback.pine (VWAP pullback strategy)
+//   - stockdownloader_orb.pine       (ORB strategy)
+//   - stockdownloader_wheel.pine     (wheel strategy timing)
+
+//@version=6
+indicator("StockDownloader VWAP Reversals", overlay=true,
+     max_labels_count=500, max_lines_count=500)
+
+// ---------------------------------------------------------------------------
+// INPUTS
+// ---------------------------------------------------------------------------
+
+string VWAP_GROUP       = "VWAP Settings"
+string MARKET_GROUP     = "Market Condition Detection"
+string REVERSAL_GROUP   = "Reversal Detection"
+string PATTERN_GROUP    = "Candlestick Patterns"
+string SR_GROUP         = "Support/Resistance"
+string TRADE_GROUP      = "Trade Management"
+string VIS_GROUP        = "Display Settings"
+
+// VWAP Settings
+vwapBand1Mult = input.float(2.0, "First Band Multiplier", minval=0.5, maxval=5.0, step=0.1,
+     group=VWAP_GROUP,
+     tooltip="Standard deviation multiplier for the first VWAP band.\n" +
+             "Recommended: 2.0 for standard setups.")
+vwapBand2Mult = input.float(3.0, "Second Band Multiplier", minval=0.5, maxval=5.0, step=0.1,
+     group=VWAP_GROUP,
+     tooltip="Standard deviation multiplier for the second VWAP band.\n" +
+             "Recommended: 3.0 for extended moves.")
+vwapSource = input.source(hlc3, "VWAP Source", group=VWAP_GROUP,
+     tooltip="Price source for VWAP calculation. HLC3 (typical price) is standard.")
+bandProximityPct = input.float(0.15, "Band Touch Proximity (%)", minval=0.05, maxval=0.5, step=0.05,
+     group=VWAP_GROUP,
+     tooltip="How close price must be to band to count as 'touching' (as % of price).")
+
+// Session Settings
+sessionStart = input.session("0930-1600", "Market Session (ET)",
+     group=VWAP_GROUP,
+     tooltip="Regular trading hours in Eastern Time.")
+sessionTimezone = input.string("America/New_York", "Timezone",
+     options=["America/New_York", "America/Chicago", "America/Denver", "America/Los_Angeles"],
+     group=VWAP_GROUP,
+     tooltip="Timezone for session calculations.")
+
+// Market Condition Settings
+skipFirstHourBars = input.int(12, "Skip First Hour (Bars)", minval=6, maxval=24,
+     group=MARKET_GROUP,
+     tooltip="Number of bars to skip at session start.\n" +
+             "12 bars = 1 hour on 5-minute chart.")
+minReversalsRequired = input.int(2, "Min Reversals in First Hour", minval=1, maxval=5,
+     group=MARKET_GROUP,
+     tooltip="Minimum number of band reversals during first hour to confirm sideways market.")
+trendHugThreshold = input.float(0.7, "Trend Hug Threshold", minval=0.5, maxval=0.9, step=0.05,
+     group=MARKET_GROUP,
+     tooltip="If price stays on one side of VWAP this % of first hour bars, it's trending.")
+maxVwapSlopeForSideways = input.float(0.02, "Max VWAP Slope for Sideways", minval=0.005, maxval=0.1, step=0.005,
+     group=MARKET_GROUP,
+     tooltip="Maximum absolute VWAP slope to consider market as sideways.")
+vwapSlopePeriod = input.int(5, "VWAP Slope Period", minval=2, maxval=20,
+     group=MARKET_GROUP,
+     tooltip="Number of bars to calculate VWAP slope direction.")
+
+// Reversal Detection Settings
+requireStrongCandle = input.bool(true, "Require Strong Confirmation Candle",
+     group=REVERSAL_GROUP,
+     tooltip="Require a strong reversal candle (not just small body) for entry.")
+strongCandleAtrMult = input.float(0.5, "Strong Candle Min Size (ATR)", minval=0.2, maxval=1.5, step=0.1,
+     group=REVERSAL_GROUP,
+     tooltip="Minimum candle body size as multiple of ATR for strong confirmation.")
+lookbackForSlowdown = input.int(3, "Slowdown Lookback Bars", minval=2, maxval=6,
+     group=REVERSAL_GROUP,
+     tooltip="Number of bars to check for momentum slowdown before reversal.")
+
+// Candlestick Pattern Settings
+usePatternFilter = input.bool(true, "Require Candlestick Pattern",
+     group=PATTERN_GROUP,
+     tooltip="Require a reversal candlestick pattern for entry confirmation.")
+hammerBodyRatio = input.float(0.35, "Hammer Body Ratio", minval=0.1, maxval=0.5, step=0.05,
+     group=PATTERN_GROUP,
+     tooltip="Maximum body size as ratio of total range for hammer/shooting star.")
+hammerWickRatio = input.float(2.0, "Hammer Wick Ratio", minval=1.5, maxval=4.0, step=0.1,
+     group=PATTERN_GROUP,
+     tooltip="Minimum ratio of long wick to body for hammer patterns.")
+smallBodyRatio = input.float(0.3, "Small Body Ratio", minval=0.1, maxval=0.5, step=0.05,
+     group=PATTERN_GROUP,
+     tooltip="Maximum body/range ratio to qualify as small body candle.")
+
+// Support/Resistance Settings
+useSRConfluence = input.bool(true, "Use S/R Confluence",
+     group=SR_GROUP,
+     tooltip="Look for VWAP bands coinciding with support/resistance levels.")
+srProximityPct = input.float(0.3, "S/R Proximity (%)", minval=0.1, maxval=1.0, step=0.1,
+     group=SR_GROUP,
+     tooltip="How close band must be to S/R level as percentage of price.")
+
+// Trade Management
+riskRewardRatio = input.float(1.0, "Risk/Reward Ratio", minval=0.5, maxval=3.0, step=0.25,
+     group=TRADE_GROUP,
+     tooltip="Target profit as multiple of stop loss distance.\n" +
+             "1.0 = 1:1 risk/reward (recommended for high win-rate band reversals).")
+stopAboveConfirmation = input.bool(true, "Stop Above/Below Confirmation Candle",
+     group=TRADE_GROUP,
+     tooltip="Place stop loss above (shorts) or below (longs) the confirmation candle.")
+atrBufferMult = input.float(0.25, "Stop Loss ATR Buffer", minval=0.1, maxval=1.0, step=0.05,
+     group=TRADE_GROUP,
+     tooltip="ATR multiplier added to stop loss for buffer.")
+maxSignalsPerDay = input.int(4, "Max Signals Per Day", minval=1, maxval=10,
+     group=TRADE_GROUP,
+     tooltip="Maximum number of reversal signals to generate per day.")
+
+// Display Settings
+showDashboard = input.bool(true, "Show Dashboard", group=VIS_GROUP)
+showVwapBands = input.bool(true, "Show VWAP Bands", group=VIS_GROUP)
+showSignalLabels = input.bool(true, "Show Signal Labels", group=VIS_GROUP)
+showSRLevels = input.bool(true, "Show S/R Levels", group=VIS_GROUP)
+showBgTint = input.bool(true, "Show Background Tint", group=VIS_GROUP)
+showFirstHourZone = input.bool(true, "Show First Hour Zone", group=VIS_GROUP)
+showReversalMarkers = input.bool(true, "Show Reversal Markers", group=VIS_GROUP)
+vwapColor = input.color(color.new(#673ab7, 0), "VWAP Color", group=VIS_GROUP)
+band1Color = input.color(color.new(#2196f3, 50), "Band 1 Color", group=VIS_GROUP)
+band2Color = input.color(color.new(#ff9800, 50), "Band 2 Color", group=VIS_GROUP)
+
+// ---------------------------------------------------------------------------
+// SESSION & TIME CALCULATIONS
+// ---------------------------------------------------------------------------
+
+// Detect if we are in the market session
+inSession = not na(time(timeframe.period, sessionStart, sessionTimezone))
+
+// Track session start
+var int sessionStartTime = na
+var int barsFromSessionStart = 0
+var bool isNewSession = false
+
+// Detect new session
+newSession = inSession and not inSession[1]
+if newSession
+    sessionStartTime := time
+    barsFromSessionStart := 0
+    isNewSession := true
+else
+    isNewSession := false
+    if inSession
+        barsFromSessionStart += 1
+
+// Session end detection
+isSessionEnd = not inSession and inSession[1]
+
+// Check if we're past the first hour
+bool pastFirstHour = barsFromSessionStart > skipFirstHourBars
+bool inFirstHour = inSession and barsFromSessionStart <= skipFirstHourBars
+
+// ---------------------------------------------------------------------------
+// VWAP CALCULATION WITH BANDS
+// ---------------------------------------------------------------------------
+
+// Custom VWAP with standard deviation bands
+var float sumPV = 0.0
+var float sumV = 0.0
+var float sumPV2 = 0.0
+
+// Reset at session start
+if newSession
+    sumPV := 0.0
+    sumV := 0.0
+    sumPV2 := 0.0
+
+// Accumulate values
+if inSession
+    sumPV += vwapSource * volume
+    sumV += volume
+    sumPV2 += vwapSource * vwapSource * volume
+
+// Calculate VWAP and standard deviation
+float vwapVal = sumV > 0 ? sumPV / sumV : na
+float variance = sumV > 0 ? (sumPV2 / sumV) - (vwapVal * vwapVal) : na
+float stdev = variance > 0 ? math.sqrt(variance) : 0
+
+// Calculate bands
+float vwapUpper1 = not na(vwapVal) ? vwapVal + (stdev * vwapBand1Mult) : na
+float vwapLower1 = not na(vwapVal) ? vwapVal - (stdev * vwapBand1Mult) : na
+float vwapUpper2 = not na(vwapVal) ? vwapVal + (stdev * vwapBand2Mult) : na
+float vwapLower2 = not na(vwapVal) ? vwapVal - (stdev * vwapBand2Mult) : na
+
+// VWAP slope calculation
+float vwapSlope = not na(vwapVal) and not na(vwapVal[vwapSlopePeriod]) ?
+     (vwapVal - vwapVal[vwapSlopePeriod]) / vwapVal[vwapSlopePeriod] : 0
+float absVwapSlope = math.abs(vwapSlope)
+bool vwapSlopeFlat = absVwapSlope <= maxVwapSlopeForSideways
+
+// ---------------------------------------------------------------------------
+// TECHNICAL INDICATORS
+// ---------------------------------------------------------------------------
+
+// ATR for volatility-adjusted calculations
+atrVal = ta.atr(14)
+
+// RSI for additional context
+rsiVal = ta.rsi(close, 14)
+
+// Volume analysis
+avgVol20 = ta.sma(volume, 20)
+relativeVol = avgVol20 > 0 ? volume / avgVol20 : 0
+
+// Previous day high/low for S/R
+prevDayHigh = request.security(syminfo.tickerid, "D", high[1],
+     lookahead=barmerge.lookahead_on)
+prevDayLow = request.security(syminfo.tickerid, "D", low[1],
+     lookahead=barmerge.lookahead_on)
+prevDayClose = request.security(syminfo.tickerid, "D", close[1],
+     lookahead=barmerge.lookahead_on)
+
+// ---------------------------------------------------------------------------
+// SIDEWAYS MARKET DETECTION
+// ---------------------------------------------------------------------------
+
+// Track first hour band touches and reversals
+var int upperBandTouches = 0
+var int lowerBandTouches = 0
+var int reversalsFromUpper = 0
+var int reversalsFromLower = 0
+var int barsAboveVwap = 0
+var int barsBelowVwap = 0
+var bool wasTouchingUpper = false
+var bool wasTouchingLower = false
+
+// Band touch detection
+float upperBandDist = not na(vwapUpper1) ? math.abs(high - vwapUpper1) / vwapUpper1 * 100 : 999
+float lowerBandDist = not na(vwapLower1) ? math.abs(low - vwapLower1) / vwapLower1 * 100 : 999
+bool touchingUpperBand = upperBandDist <= bandProximityPct or high >= vwapUpper1
+bool touchingLowerBand = lowerBandDist <= bandProximityPct or low <= vwapLower1
+
+// Reset tracking at new session
+if newSession
+    upperBandTouches := 0
+    lowerBandTouches := 0
+    reversalsFromUpper := 0
+    reversalsFromLower := 0
+    barsAboveVwap := 0
+    barsBelowVwap := 0
+    wasTouchingUpper := false
+    wasTouchingLower := false
+
+// Track during first hour
+if inFirstHour and not na(vwapVal)
+    // Count bars above/below VWAP
+    if close > vwapVal
+        barsAboveVwap += 1
+    else if close < vwapVal
+        barsBelowVwap += 1
+
+    // Track band touches
+    if touchingUpperBand and not wasTouchingUpper
+        upperBandTouches += 1
+    if touchingLowerBand and not wasTouchingLower
+        lowerBandTouches += 1
+
+    // Detect reversals (price touches band then moves away)
+    if wasTouchingUpper and not touchingUpperBand and close < high[1]
+        reversalsFromUpper += 1
+    if wasTouchingLower and not touchingLowerBand and close > low[1]
+        reversalsFromLower += 1
+
+    wasTouchingUpper := touchingUpperBand
+    wasTouchingLower := touchingLowerBand
+
+// Calculate market condition scores
+int totalReversals = reversalsFromUpper + reversalsFromLower
+float aboveVwapRatio = barsFromSessionStart > 0 ? float(barsAboveVwap) / float(math.max(1, barsFromSessionStart)) : 0
+float belowVwapRatio = barsFromSessionStart > 0 ? float(barsBelowVwap) / float(math.max(1, barsFromSessionStart)) : 0
+
+// Determine if market is trending (hugging one band)
+bool trendingUp = aboveVwapRatio >= trendHugThreshold
+bool trendingDown = belowVwapRatio >= trendHugThreshold
+bool isTrending = trendingUp or trendingDown
+
+// Sideways market conditions
+bool hasSufficientReversals = totalReversals >= minReversalsRequired
+bool isSidewaysMarket = pastFirstHour and hasSufficientReversals and not isTrending and vwapSlopeFlat
+
+// Market condition score (0-100)
+float marketConditionScore = 0.0
+float maxMarketScore = 0.0
+
+if pastFirstHour
+    // Factor 1: Reversal count (0-30 points)
+    maxMarketScore += 30.0
+    if totalReversals >= 4
+        marketConditionScore += 30.0
+    else if totalReversals >= 3
+        marketConditionScore += 25.0
+    else if totalReversals >= 2
+        marketConditionScore += 20.0
+    else if totalReversals >= 1
+        marketConditionScore += 10.0
+
+    // Factor 2: Balance (price not hugging one side) (0-25 points)
+    maxMarketScore += 25.0
+    float balanceRatio = 1.0 - math.abs(aboveVwapRatio - belowVwapRatio)
+    marketConditionScore += balanceRatio * 25.0
+
+    // Factor 3: VWAP slope flatness (0-25 points)
+    maxMarketScore += 25.0
+    if absVwapSlope <= maxVwapSlopeForSideways * 0.5
+        marketConditionScore += 25.0
+    else if absVwapSlope <= maxVwapSlopeForSideways
+        marketConditionScore += 15.0
+    else if absVwapSlope <= maxVwapSlopeForSideways * 1.5
+        marketConditionScore += 5.0
+
+    // Factor 4: Both bands touched (0-20 points)
+    maxMarketScore += 20.0
+    if upperBandTouches >= 1 and lowerBandTouches >= 1
+        marketConditionScore += 20.0
+    else if upperBandTouches >= 1 or lowerBandTouches >= 1
+        marketConditionScore += 10.0
+
+float marketConditionPct = maxMarketScore > 0 ? (marketConditionScore / maxMarketScore) * 100 : 0
+
+// Market condition classification
+string marketCondition = isSidewaysMarket ? "SIDEWAYS" :
+                         isTrending ? (trendingUp ? "TRENDING UP" : "TRENDING DOWN") :
+                         pastFirstHour ? "UNCERTAIN" : "FIRST HOUR"
+
+// ---------------------------------------------------------------------------
+// CANDLESTICK PATTERN DETECTION
+// ---------------------------------------------------------------------------
+
+// Candle components
+float bodySize = math.abs(close - open)
+float upperWick = high - math.max(close, open)
+float lowerWick = math.min(close, open) - low
+float totalRange = high - low
+bool isBullishCandle = close > open
+bool isBearishCandle = close < open
+bool isSmallBody = totalRange > 0 and (bodySize / totalRange) <= smallBodyRatio
+
+// Strong candle detection
+bool isStrongBullish = isBullishCandle and bodySize >= atrVal * strongCandleAtrMult
+bool isStrongBearish = isBearishCandle and bodySize >= atrVal * strongCandleAtrMult
+
+// --- Bearish Hammer (Shooting Star) for sell signals at upper band ---
+bool isShootingStar = totalRange > 0 and
+     (bodySize / totalRange) <= hammerBodyRatio and
+     upperWick >= (bodySize * hammerWickRatio) and
+     lowerWick < upperWick * 0.5
+
+// --- Bearish Engulfing ---
+bool isBearishEngulfing = isBearishCandle and
+     close[1] > open[1] and  // Previous candle was bullish
+     close < open[1] and      // Current close below previous open
+     open > close[1] and      // Current open above previous close
+     bodySize >= atrVal * 0.4
+
+// --- Small body red candles near upper band (bearish signal) ---
+bool isSmallBodyBearish = isBearishCandle and isSmallBody
+
+// --- Bullish Hammer for buy signals at lower band ---
+bool isHammer = totalRange > 0 and
+     (bodySize / totalRange) <= hammerBodyRatio and
+     lowerWick >= (bodySize * hammerWickRatio) and
+     upperWick < lowerWick * 0.5
+
+// --- Bullish Engulfing ---
+bool isBullishEngulfing = isBullishCandle and
+     close[1] < open[1] and  // Previous candle was bearish
+     close > open[1] and      // Current close above previous open
+     open < close[1] and      // Current open below previous close
+     bodySize >= atrVal * 0.4
+
+// --- Small body candles (momentum slowdown) ---
+bool isSmallBodyBullish = isBullishCandle and isSmallBody
+
+// --- Check for momentum slowdown (multiple small candles) ---
+var int consecutiveSmallBodies = 0
+if isSmallBody
+    consecutiveSmallBodies += 1
+else
+    consecutiveSmallBodies := 0
+
+bool momentumSlowing = consecutiveSmallBodies >= 2 or
+     (isSmallBody and isSmallBody[1])
+
+// Combined pattern signals for reversals
+bool bearishReversalPattern = isShootingStar or isBearishEngulfing or
+     (isSmallBodyBearish and touchingUpperBand)
+bool bullishReversalPattern = isHammer or isBullishEngulfing or
+     (momentumSlowing and isStrongBullish)
+
+// Pattern filter check
+bool patternConfirmedSell = not usePatternFilter or bearishReversalPattern or
+     (isStrongBearish and touchingUpperBand)
+bool patternConfirmedBuy = not usePatternFilter or bullishReversalPattern or
+     (isStrongBullish and touchingLowerBand)
+
+// ---------------------------------------------------------------------------
+// SUPPORT/RESISTANCE CONFLUENCE
+// ---------------------------------------------------------------------------
+
+// Check if VWAP bands coincide with previous day's S/R levels
+bool upperBandAtPrevDayHigh = not na(prevDayHigh) and not na(vwapUpper1) and
+     math.abs(vwapUpper1 - prevDayHigh) / prevDayHigh * 100 <= srProximityPct
+bool upperBandAtPrevDayClose = not na(prevDayClose) and not na(vwapUpper1) and
+     math.abs(vwapUpper1 - prevDayClose) / prevDayClose * 100 <= srProximityPct
+bool lowerBandAtPrevDayLow = not na(prevDayLow) and not na(vwapLower1) and
+     math.abs(vwapLower1 - prevDayLow) / prevDayLow * 100 <= srProximityPct
+bool lowerBandAtPrevDayClose = not na(prevDayClose) and not na(vwapLower1) and
+     math.abs(vwapLower1 - prevDayClose) / prevDayClose * 100 <= srProximityPct
+
+// S/R confluence score for upper band (resistance)
+float upperSRScore = 0.0
+if upperBandAtPrevDayHigh
+    upperSRScore += 40.0
+if upperBandAtPrevDayClose
+    upperSRScore += 25.0
+
+// S/R confluence score for lower band (support)
+float lowerSRScore = 0.0
+if lowerBandAtPrevDayLow
+    lowerSRScore += 40.0
+if lowerBandAtPrevDayClose
+    lowerSRScore += 25.0
+
+bool hasUpperSRConfluence = not useSRConfluence or upperSRScore > 0
+bool hasLowerSRConfluence = not useSRConfluence or lowerSRScore > 0
+
+// ---------------------------------------------------------------------------
+// REVERSAL SIGNAL GENERATION
+// ---------------------------------------------------------------------------
+
+var int todaySignalCount = 0
+
+// Reset signal count on new session
+if newSession
+    todaySignalCount := 0
+
+// Check signal limit
+bool canSignal = todaySignalCount < maxSignalsPerDay
+
+// --- Sell Signal (Short Entry at Upper Band) ---
+// Sideways market + price at upper band + bearish pattern + S/R confluence
+bool sellCondition = inSession and
+     pastFirstHour and
+     isSidewaysMarket and
+     touchingUpperBand and
+     patternConfirmedSell and
+     hasUpperSRConfluence and
+     canSignal and
+     (isStrongBearish or not requireStrongCandle or bearishReversalPattern)
+
+// --- Buy Signal (Long Entry at Lower Band) ---
+// Sideways market + price at lower band + bullish pattern + S/R confluence
+bool buyCondition = inSession and
+     pastFirstHour and
+     isSidewaysMarket and
+     touchingLowerBand and
+     patternConfirmedBuy and
+     hasLowerSRConfluence and
+     canSignal and
+     (isStrongBullish or not requireStrongCandle or bullishReversalPattern)
+
+// Track confirmed signals
+bool buySignal = buyCondition and barstate.isconfirmed
+bool sellSignal = sellCondition and barstate.isconfirmed
+
+// Update signal count
+if buySignal or sellSignal
+    todaySignalCount += 1
+
+// ---------------------------------------------------------------------------
+// STOP LOSS AND TAKE PROFIT CALCULATION
+// ---------------------------------------------------------------------------
+
+// Calculate stop loss levels (above/below confirmation candle)
+float longStopLoss = na
+float shortStopLoss = na
+float longTakeProfit = na
+float shortTakeProfit = na
+float longRiskDist = na
+float shortRiskDist = na
+
+if buySignal
+    if stopAboveConfirmation
+        // Stop below the confirmation candle's low
+        longStopLoss := low - (atrVal * atrBufferMult)
+    else
+        // Stop below lower band
+        longStopLoss := vwapLower1 - (atrVal * atrBufferMult)
+    longRiskDist := close - longStopLoss
+    // Target VWAP line with specified R/R (default 1:1)
+    float distToVwap = math.abs(close - vwapVal)
+    longTakeProfit := vwapVal  // Target VWAP directly
+
+if sellSignal
+    if stopAboveConfirmation
+        // Stop above the confirmation candle's high
+        shortStopLoss := high + (atrVal * atrBufferMult)
+    else
+        // Stop above upper band
+        shortStopLoss := vwapUpper1 + (atrVal * atrBufferMult)
+    shortRiskDist := shortStopLoss - close
+    // Target VWAP line with specified R/R (default 1:1)
+    float distToVwap = math.abs(close - vwapVal)
+    shortTakeProfit := vwapVal  // Target VWAP directly
+
+// Store levels for display
+var float activeLongStop = na
+var float activeLongTarget = na
+var float activeShortStop = na
+var float activeShortTarget = na
+var float activeEntryPrice = na
+var int activeTradeDir = 0  // 1 = long, -1 = short, 0 = none
+
+if buySignal
+    activeLongStop := longStopLoss
+    activeLongTarget := longTakeProfit
+    activeEntryPrice := close
+    activeTradeDir := 1
+    activeShortStop := na
+    activeShortTarget := na
+
+if sellSignal
+    activeShortStop := shortStopLoss
+    activeShortTarget := shortTakeProfit
+    activeEntryPrice := close
+    activeTradeDir := -1
+    activeLongStop := na
+    activeLongTarget := na
+
+// Reset on session end
+if isSessionEnd
+    activeLongStop := na
+    activeLongTarget := na
+    activeShortStop := na
+    activeShortTarget := na
+    activeEntryPrice := na
+    activeTradeDir := 0
+
+// ---------------------------------------------------------------------------
+// SIGNAL QUALITY SCORING
+// ---------------------------------------------------------------------------
+
+float signalScore = 0.0
+float maxSignalScore = 0.0
+
+// --- Factor 1: Market Condition Score (0-25 points) ---
+maxSignalScore += 25.0
+if marketConditionPct >= 80
+    signalScore += 25.0
+else if marketConditionPct >= 60
+    signalScore += 20.0
+else if marketConditionPct >= 40
+    signalScore += 15.0
+else
+    signalScore += 5.0
+
+// --- Factor 2: Pattern Quality (0-25 points) ---
+maxSignalScore += 25.0
+if (sellCondition and (isBearishEngulfing or isShootingStar)) or
+   (buyCondition and (isBullishEngulfing or isHammer))
+    signalScore += 25.0
+else if (sellCondition and isStrongBearish) or (buyCondition and isStrongBullish)
+    signalScore += 20.0
+else if patternConfirmedSell or patternConfirmedBuy
+    signalScore += 10.0
+
+// --- Factor 3: S/R Confluence (0-20 points) ---
+maxSignalScore += 20.0
+float currentSRScore = sellCondition ? upperSRScore : lowerSRScore
+signalScore += math.min(currentSRScore * 0.5, 20.0)
+
+// --- Factor 4: Volume (0-15 points) ---
+maxSignalScore += 15.0
+if relativeVol >= 1.5
+    signalScore += 15.0
+else if relativeVol >= 1.2
+    signalScore += 10.0
+else if relativeVol >= 1.0
+    signalScore += 5.0
+
+// --- Factor 5: Band Touch Quality (0-15 points) ---
+maxSignalScore += 15.0
+if sellCondition
+    // Better if actually breached upper band
+    if high > vwapUpper1
+        signalScore += 15.0
+    else if upperBandDist <= bandProximityPct * 0.5
+        signalScore += 10.0
+    else
+        signalScore += 5.0
+else if buyCondition
+    // Better if actually breached lower band
+    if low < vwapLower1
+        signalScore += 15.0
+    else if lowerBandDist <= bandProximityPct * 0.5
+        signalScore += 10.0
+    else
+        signalScore += 5.0
+
+// Normalize score
+float signalPctScore = maxSignalScore > 0 ? (signalScore / maxSignalScore) * 100 : 0
+
+// Quality classification
+string signalQuality = signalPctScore >= 80 ? "STRONG" :
+                        signalPctScore >= 60 ? "GOOD" :
+                        signalPctScore >= 40 ? "MODERATE" : "WEAK"
+
+// ---------------------------------------------------------------------------
+// CHART VISUALS -- VWAP AND BANDS
+// ---------------------------------------------------------------------------
+
+// Plot VWAP
+plot(inSession ? vwapVal : na, "VWAP", color=vwapColor, linewidth=2)
+
+// Plot bands if enabled
+p_upper1 = plot(inSession and showVwapBands ? vwapUpper1 : na, "Upper Band 1",
+     color=band1Color, linewidth=1)
+p_lower1 = plot(inSession and showVwapBands ? vwapLower1 : na, "Lower Band 1",
+     color=band1Color, linewidth=1)
+p_upper2 = plot(inSession and showVwapBands ? vwapUpper2 : na, "Upper Band 2",
+     color=band2Color, linewidth=1, style=plot.style_linebr)
+p_lower2 = plot(inSession and showVwapBands ? vwapLower2 : na, "Lower Band 2",
+     color=band2Color, linewidth=1, style=plot.style_linebr)
+
+// Fill between bands
+fill(p_upper1, p_lower1, color=color.new(vwapColor, 95), title="VWAP Zone Fill")
+
+// ---------------------------------------------------------------------------
+// CHART VISUALS -- S/R LEVELS
+// ---------------------------------------------------------------------------
+
+if showSRLevels and inSession and barstate.islast
+    // Previous day high near upper band
+    if upperBandAtPrevDayHigh
+        line.new(bar_index - 50, prevDayHigh, bar_index, prevDayHigh,
+             color=color.new(color.red, 40), width=1, style=line.style_dashed)
+    // Previous day low near lower band
+    if lowerBandAtPrevDayLow
+        line.new(bar_index - 50, prevDayLow, bar_index, prevDayLow,
+             color=color.new(color.green, 40), width=1, style=line.style_dashed)
+    // Previous day close
+    if upperBandAtPrevDayClose or lowerBandAtPrevDayClose
+        line.new(bar_index - 50, prevDayClose, bar_index, prevDayClose,
+             color=color.new(color.gray, 40), width=1, style=line.style_dashed)
+
+// ---------------------------------------------------------------------------
+// CHART VISUALS -- SIGNAL LABELS
+// ---------------------------------------------------------------------------
+
+if showSignalLabels
+    if buySignal
+        float rrRatio = longRiskDist > 0 ? (vwapVal - close) / longRiskDist : 0
+        string buyText = "BUY REVERSAL\n" +
+             signalQuality + " (" + str.tostring(signalPctScore, "#.0") + "%)\n" +
+             "Entry: " + str.tostring(close, "#.##") + "\n" +
+             "Stop: " + str.tostring(longStopLoss, "#.##") + "\n" +
+             "Target: VWAP " + str.tostring(vwapVal, "#.##")
+        color buyColor = signalPctScore >= 80 ? color.lime :
+                          signalPctScore >= 60 ? color.green : #4caf50
+        label.new(bar_index, low, buyText,
+             style=label.style_label_up, color=color.new(buyColor, 10),
+             textcolor=color.white, size=size.small)
+
+        // Draw stop loss and take profit lines
+        line.new(bar_index, longStopLoss, bar_index + 20, longStopLoss,
+             color=color.new(color.red, 30), width=2, style=line.style_dashed)
+        line.new(bar_index, vwapVal, bar_index + 20, vwapVal,
+             color=color.new(color.green, 30), width=2, style=line.style_solid)
+
+    if sellSignal
+        float rrRatio = shortRiskDist > 0 ? (close - vwapVal) / shortRiskDist : 0
+        string sellText = "SELL REVERSAL\n" +
+             signalQuality + " (" + str.tostring(signalPctScore, "#.0") + "%)\n" +
+             "Entry: " + str.tostring(close, "#.##") + "\n" +
+             "Stop: " + str.tostring(shortStopLoss, "#.##") + "\n" +
+             "Target: VWAP " + str.tostring(vwapVal, "#.##")
+        color sellColor = signalPctScore >= 80 ? #ff1744 :
+                          signalPctScore >= 60 ? #ff4444 : #ff8888
+        label.new(bar_index, high, sellText,
+             style=label.style_label_down, color=color.new(sellColor, 10),
+             textcolor=color.white, size=size.small)
+
+        // Draw stop loss and take profit lines
+        line.new(bar_index, shortStopLoss, bar_index + 20, shortStopLoss,
+             color=color.new(color.red, 30), width=2, style=line.style_dashed)
+        line.new(bar_index, vwapVal, bar_index + 20, vwapVal,
+             color=color.new(color.green, 30), width=2, style=line.style_solid)
+
+// ---------------------------------------------------------------------------
+// CHART VISUALS -- BACKGROUND TINT
+// ---------------------------------------------------------------------------
+
+// Tint first hour (no trading zone)
+color firstHourBg = inFirstHour and showFirstHourZone and showBgTint ?
+     color.new(color.gray, 93) : na
+bgcolor(firstHourBg, title="First Hour Zone")
+
+// Tint when at bands (potential reversal zone)
+color upperBandBg = touchingUpperBand and pastFirstHour and isSidewaysMarket and showBgTint ?
+     color.new(color.red, 93) : na
+color lowerBandBg = touchingLowerBand and pastFirstHour and isSidewaysMarket and showBgTint ?
+     color.new(color.green, 93) : na
+bgcolor(upperBandBg, title="Upper Band Zone")
+bgcolor(lowerBandBg, title="Lower Band Zone")
+
+// Tint on signals
+color buyBg = buySignal and showBgTint ? color.new(color.green, 90) : na
+color sellBg = sellSignal and showBgTint ? color.new(color.red, 90) : na
+bgcolor(buyBg, title="Buy Signal Background")
+bgcolor(sellBg, title="Sell Signal Background")
+
+// ---------------------------------------------------------------------------
+// REVERSAL MARKERS DURING FIRST HOUR
+// ---------------------------------------------------------------------------
+
+// Show when reversals from bands occur during first hour
+if showReversalMarkers and inFirstHour
+    if wasTouchingUpper[1] and not touchingUpperBand and close < high[1]
+        label.new(bar_index, high, "R", style=label.style_circle,
+             color=color.new(color.red, 50), textcolor=color.white, size=size.tiny)
+    if wasTouchingLower[1] and not touchingLowerBand and close > low[1]
+        label.new(bar_index, low, "R", style=label.style_circle,
+             color=color.new(color.green, 50), textcolor=color.white, size=size.tiny)
+
+// ---------------------------------------------------------------------------
+// PATTERN INDICATORS (PLOT SHAPES)
+// ---------------------------------------------------------------------------
+
+// Show pattern markers when patterns are detected at bands
+plotshape(isHammer and touchingLowerBand and pastFirstHour and inSession,
+     title="Hammer at Support", location=location.belowbar,
+     color=color.new(color.green, 20), style=shape.triangleup, size=size.tiny)
+plotshape(isBullishEngulfing and touchingLowerBand and pastFirstHour and inSession,
+     title="Bullish Engulfing at Support", location=location.belowbar,
+     color=color.new(color.lime, 20), style=shape.arrowup, size=size.tiny)
+plotshape(isShootingStar and touchingUpperBand and pastFirstHour and inSession,
+     title="Shooting Star at Resistance", location=location.abovebar,
+     color=color.new(color.red, 20), style=shape.triangledown, size=size.tiny)
+plotshape(isBearishEngulfing and touchingUpperBand and pastFirstHour and inSession,
+     title="Bearish Engulfing at Resistance", location=location.abovebar,
+     color=color.new(color.orange, 20), style=shape.arrowdown, size=size.tiny)
+
+// ---------------------------------------------------------------------------
+// ALERTS
+// ---------------------------------------------------------------------------
+
+alertcondition(buySignal, title="VWAP Reversal Buy Signal",
+     message="VWAP REVERSAL: BUY signal on {{ticker}} | " +
+             "Quality: " + signalQuality + " (" + str.tostring(signalPctScore, "#.0") + "%) | " +
+             "Entry: {{close}} | Target: VWAP")
+
+alertcondition(sellSignal, title="VWAP Reversal Sell Signal",
+     message="VWAP REVERSAL: SELL signal on {{ticker}} | " +
+             "Quality: " + signalQuality + " (" + str.tostring(signalPctScore, "#.0") + "%) | " +
+             "Entry: {{close}} | Target: VWAP")
+
+alertcondition(buySignal and signalPctScore >= 80, title="Strong VWAP Reversal Buy",
+     message="VWAP REVERSAL: STRONG BUY on {{ticker}} | Score: " +
+             str.tostring(signalPctScore, "#.0"))
+
+alertcondition(sellSignal and signalPctScore >= 80, title="Strong VWAP Reversal Sell",
+     message="VWAP REVERSAL: STRONG SELL on {{ticker}} | Score: " +
+             str.tostring(signalPctScore, "#.0"))
+
+alertcondition(pastFirstHour and isSidewaysMarket and not isSidewaysMarket[1],
+     title="Sideways Market Confirmed",
+     message="VWAP REVERSAL: Sideways market confirmed on {{ticker}} | " +
+             "Reversals: " + str.tostring(totalReversals) + " | Ready for band reversals")
+
+alertcondition(touchingUpperBand and pastFirstHour and isSidewaysMarket,
+     title="At Upper Band (Potential Short)",
+     message="VWAP REVERSAL: Price at upper band on {{ticker}} | Watch for bearish reversal")
+
+alertcondition(touchingLowerBand and pastFirstHour and isSidewaysMarket,
+     title="At Lower Band (Potential Long)",
+     message="VWAP REVERSAL: Price at lower band on {{ticker}} | Watch for bullish reversal")
+
+// ---------------------------------------------------------------------------
+// DASHBOARD TABLE
+// ---------------------------------------------------------------------------
+
+if showDashboard and barstate.islast
+    var table dash = table.new(position.top_right, 2, 30,
+         bgcolor=color.new(color.black, 15), border_width=1, border_color=color.gray,
+         frame_width=1, frame_color=color.gray)
+
+    headerBg = color.new(#1a1a2e, 0)
+    sepBg    = color.new(#2a2a4a, 0)
+    textCol  = color.white
+
+    // ---- Row 0: Title ----
+    table.cell(dash, 0, 0, "VWAP Reversals", text_color=textCol, bgcolor=headerBg,
+         text_size=size.small, text_halign=text.align_center)
+    table.merge_cells(dash, 0, 0, 1, 0)
+
+    // ---- Row 1: Market Condition Section ----
+    table.cell(dash, 0, 1, "--- Market Condition ---", text_color=color.yellow, bgcolor=sepBg,
+         text_size=size.tiny, text_halign=text.align_center)
+    table.merge_cells(dash, 0, 1, 1, 1)
+
+    // Row 2: Market Status
+    color marketColor = isSidewaysMarket ? color.green :
+                        isTrending ? color.red :
+                        inFirstHour ? color.gray : color.yellow
+    table.cell(dash, 0, 2, "Market", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(dash, 1, 2, marketCondition, text_color=marketColor, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 3: Condition Score
+    color condScoreColor = marketConditionPct >= 70 ? color.lime :
+                           marketConditionPct >= 50 ? color.green : color.yellow
+    table.cell(dash, 0, 3, "Condition Score", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(dash, 1, 3, pastFirstHour ? str.tostring(marketConditionPct, "#.0") + "%" : "---",
+         text_color=condScoreColor, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 4: Session Progress
+    string sessionProgressStr = inFirstHour ?
+         "Bar " + str.tostring(barsFromSessionStart) + "/" + str.tostring(skipFirstHourBars) :
+         "TRADING"
+    color sessionColor = inFirstHour ? color.orange : color.green
+    table.cell(dash, 0, 4, "Session", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(dash, 1, 4, inSession ? sessionProgressStr : "CLOSED",
+         text_color=inSession ? sessionColor : color.gray, bgcolor=headerBg, text_size=size.tiny)
+
+    // ---- Row 5: First Hour Analysis Section ----
+    table.cell(dash, 0, 5, "--- First Hour Analysis ---", text_color=color.yellow, bgcolor=sepBg,
+         text_size=size.tiny, text_halign=text.align_center)
+    table.merge_cells(dash, 0, 5, 1, 5)
+
+    // Row 6: Total Reversals
+    color reversalColor = totalReversals >= minReversalsRequired ? color.green :
+                          totalReversals >= 1 ? color.yellow : color.gray
+    table.cell(dash, 0, 6, "Band Reversals", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(dash, 1, 6, str.tostring(totalReversals) + " (min: " + str.tostring(minReversalsRequired) + ")",
+         text_color=reversalColor, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 7: Upper Band Touches
+    table.cell(dash, 0, 7, "Upper Touches", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(dash, 1, 7, str.tostring(upperBandTouches),
+         text_color=upperBandTouches > 0 ? color.orange : color.gray, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 8: Lower Band Touches
+    table.cell(dash, 0, 8, "Lower Touches", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(dash, 1, 8, str.tostring(lowerBandTouches),
+         text_color=lowerBandTouches > 0 ? color.teal : color.gray, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 9: VWAP Balance
+    string balanceStr = aboveVwapRatio > 0.6 ? "ABOVE BIAS" :
+                        belowVwapRatio > 0.6 ? "BELOW BIAS" : "BALANCED"
+    color balanceColor = math.abs(aboveVwapRatio - belowVwapRatio) <= 0.3 ? color.green : color.yellow
+    table.cell(dash, 0, 9, "Price Balance", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(dash, 1, 9, balanceStr, text_color=balanceColor, bgcolor=headerBg, text_size=size.tiny)
+
+    // ---- Row 10: VWAP Levels Section ----
+    table.cell(dash, 0, 10, "--- VWAP Levels ---", text_color=color.yellow, bgcolor=sepBg,
+         text_size=size.tiny, text_halign=text.align_center)
+    table.merge_cells(dash, 0, 10, 1, 10)
+
+    // Row 11: VWAP Value
+    table.cell(dash, 0, 11, "VWAP", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(dash, 1, 11, not na(vwapVal) ? str.tostring(vwapVal, "#.##") : "---",
+         text_color=vwapColor, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 12: Upper Band 1
+    table.cell(dash, 0, 12, "Upper Band (2\u03C3)", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(dash, 1, 12, not na(vwapUpper1) ? str.tostring(vwapUpper1, "#.##") : "---",
+         text_color=band1Color, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 13: Lower Band 1
+    table.cell(dash, 0, 13, "Lower Band (2\u03C3)", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(dash, 1, 13, not na(vwapLower1) ? str.tostring(vwapLower1, "#.##") : "---",
+         text_color=band1Color, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 14: VWAP Slope
+    string slopeStr = vwapSlopeFlat ? "FLAT" : vwapSlope > 0 ? "UP" : "DOWN"
+    color slopeColor = vwapSlopeFlat ? color.green : color.yellow
+    table.cell(dash, 0, 14, "VWAP Slope", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(dash, 1, 14, slopeStr + " (" + str.tostring(absVwapSlope * 100, "#.##") + "%)",
+         text_color=slopeColor, bgcolor=headerBg, text_size=size.tiny)
+
+    // ---- Row 15: Current Position Section ----
+    table.cell(dash, 0, 15, "--- Current Position ---", text_color=color.yellow, bgcolor=sepBg,
+         text_size=size.tiny, text_halign=text.align_center)
+    table.merge_cells(dash, 0, 15, 1, 15)
+
+    // Row 16: Position vs Bands
+    string positionStr = touchingUpperBand ? "AT UPPER BAND" :
+                         touchingLowerBand ? "AT LOWER BAND" :
+                         close > vwapVal ? "ABOVE VWAP" : "BELOW VWAP"
+    color positionColor = touchingUpperBand ? color.red :
+                          touchingLowerBand ? color.green :
+                          close > vwapVal ? color.teal : color.orange
+    table.cell(dash, 0, 16, "Price Position", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(dash, 1, 16, positionStr, text_color=positionColor, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 17: Distance to Upper Band
+    table.cell(dash, 0, 17, "Dist to Upper", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(dash, 1, 17, str.tostring(upperBandDist, "#.##") + "%",
+         text_color=touchingUpperBand ? color.red : color.gray, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 18: Distance to Lower Band
+    table.cell(dash, 0, 18, "Dist to Lower", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(dash, 1, 18, str.tostring(lowerBandDist, "#.##") + "%",
+         text_color=touchingLowerBand ? color.green : color.gray, bgcolor=headerBg, text_size=size.tiny)
+
+    // ---- Row 19: Patterns Section ----
+    table.cell(dash, 0, 19, "--- Patterns ---", text_color=color.yellow, bgcolor=sepBg,
+         text_size=size.tiny, text_halign=text.align_center)
+    table.merge_cells(dash, 0, 19, 1, 19)
+
+    // Row 20: Bullish Patterns
+    string bullPatternStr = isHammer ? "HAMMER" :
+                            isBullishEngulfing ? "ENGULFING" :
+                            isStrongBullish ? "STRONG GREEN" :
+                            momentumSlowing and isBullishCandle ? "SLOWDOWN" : "NONE"
+    color bullPatternColor = (isHammer or isBullishEngulfing or isStrongBullish) ? color.green : color.gray
+    table.cell(dash, 0, 20, "Bullish Pattern", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(dash, 1, 20, bullPatternStr, text_color=bullPatternColor, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 21: Bearish Patterns
+    string bearPatternStr = isShootingStar ? "SHOOTING STAR" :
+                            isBearishEngulfing ? "ENGULFING" :
+                            isStrongBearish ? "STRONG RED" :
+                            isSmallBodyBearish ? "SMALL BODY" : "NONE"
+    color bearPatternColor = (isShootingStar or isBearishEngulfing or isStrongBearish) ? color.red : color.gray
+    table.cell(dash, 0, 21, "Bearish Pattern", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(dash, 1, 21, bearPatternStr, text_color=bearPatternColor, bgcolor=headerBg, text_size=size.tiny)
+
+    // ---- Row 22: S/R Confluence Section ----
+    table.cell(dash, 0, 22, "--- S/R Confluence ---", text_color=color.yellow, bgcolor=sepBg,
+         text_size=size.tiny, text_halign=text.align_center)
+    table.merge_cells(dash, 0, 22, 1, 22)
+
+    // Row 23: Upper Band S/R
+    string upperSRStr = upperBandAtPrevDayHigh ? "Prev High" :
+                        upperBandAtPrevDayClose ? "Prev Close" : "None"
+    table.cell(dash, 0, 23, "Upper Band S/R", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(dash, 1, 23, useSRConfluence ? upperSRStr : "OFF",
+         text_color=upperSRScore > 0 ? color.red : color.gray, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 24: Lower Band S/R
+    string lowerSRStr = lowerBandAtPrevDayLow ? "Prev Low" :
+                        lowerBandAtPrevDayClose ? "Prev Close" : "None"
+    table.cell(dash, 0, 24, "Lower Band S/R", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(dash, 1, 24, useSRConfluence ? lowerSRStr : "OFF",
+         text_color=lowerSRScore > 0 ? color.green : color.gray, bgcolor=headerBg, text_size=size.tiny)
+
+    // ---- Row 25: Signal Section ----
+    table.cell(dash, 0, 25, "--- Signal Status ---", text_color=color.yellow, bgcolor=sepBg,
+         text_size=size.tiny, text_halign=text.align_center)
+    table.merge_cells(dash, 0, 25, 1, 25)
+
+    // Row 26: Active Trade
+    string activeTradeStr = activeTradeDir == 1 ? "LONG" :
+                            activeTradeDir == -1 ? "SHORT" : "NONE"
+    color activeTradeColor = activeTradeDir == 1 ? color.green :
+                             activeTradeDir == -1 ? color.red : color.gray
+    table.cell(dash, 0, 26, "Active Trade", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(dash, 1, 26, activeTradeStr, text_color=activeTradeColor, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 27: Signal Quality
+    color qualityColor = signalPctScore >= 80 ? color.lime :
+                         signalPctScore >= 60 ? color.green :
+                         signalPctScore >= 40 ? color.yellow : color.gray
+    table.cell(dash, 0, 27, "Signal Quality", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(dash, 1, 27, activeTradeDir != 0 ?
+         str.tostring(signalPctScore, "#.0") + "% (" + signalQuality + ")" : "---",
+         text_color=qualityColor, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 28: Signals Today
+    table.cell(dash, 0, 28, "Signals Today", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(dash, 1, 28, str.tostring(todaySignalCount) + " / " + str.tostring(maxSignalsPerDay),
+         text_color=color.gray, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 29: Trade Target
+    table.cell(dash, 0, 29, "Target", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(dash, 1, 29, activeTradeDir != 0 ? "VWAP " + str.tostring(vwapVal, "#.##") : "---",
+         text_color=color.green, bgcolor=headerBg, text_size=size.tiny)
