@@ -1,0 +1,1010 @@
+// This Pine Script source code is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+//
+// Stock Downloader VWAP Pullback Strategy
+//
+// This strategy focuses on entering an existing trend during a temporary pause
+// or reversal back to the VWAP. Designed for 5-minute charts on liquid assets.
+//
+// Strategy Logic:
+//   1. Identify an existing uptrend or downtrend using VWAP position
+//   2. Wait for price to pull back to the VWAP line
+//   3. Confirm with confluence factors (S/R, candlestick patterns)
+//   4. Enter on reversal candles with defined stop loss and 2:1 R/R target
+//
+// VWAP Band Settings:
+//   - First band multiplier: 2 standard deviations
+//   - Second band multiplier: 3 standard deviations
+//
+// Trend Identification:
+//   - Uptrend Scenario 1: Price above VWAP from session start
+//   - Uptrend Scenario 2: Price reversed above VWAP within first 5-6 candles
+//   - Downtrend: Big green open followed by reversal below VWAP with downward slope
+//
+// Use with companion scripts:
+//   - stockdownloader_strategy.pine  (trading strategy)
+//   - stockdownloader_dashboard.pine (confluence scanner)
+//   - stockdownloader_overlay.pine   (visual indicators)
+//   - stockdownloader_orb.pine       (ORB strategy)
+//   - stockdownloader_wheel.pine     (wheel strategy timing)
+
+//@version=6
+indicator("StockDownloader VWAP Pullback", overlay=true,
+     max_labels_count=500, max_lines_count=500)
+
+// ---------------------------------------------------------------------------
+// INPUTS
+// ---------------------------------------------------------------------------
+
+string VWAP_GROUP     = "VWAP Settings"
+string TREND_GROUP    = "Trend Detection"
+string PULLBACK_GROUP = "Pullback Settings"
+string PATTERN_GROUP  = "Candlestick Patterns"
+string SR_GROUP       = "Support/Resistance"
+string TRADE_GROUP    = "Trade Management"
+string VIS_GROUP      = "Display Settings"
+
+// VWAP Settings
+vwapBand1Mult = input.float(2.0, "First Band Multiplier", minval=0.5, maxval=5.0, step=0.1,
+     group=VWAP_GROUP,
+     tooltip="Standard deviation multiplier for the first VWAP band.\n" +
+             "Recommended: 2.0 for standard setups.")
+vwapBand2Mult = input.float(3.0, "Second Band Multiplier", minval=0.5, maxval=5.0, step=0.1,
+     group=VWAP_GROUP,
+     tooltip="Standard deviation multiplier for the second VWAP band.\n" +
+             "Recommended: 3.0 for extended moves.")
+vwapSource = input.source(hlc3, "VWAP Source", group=VWAP_GROUP,
+     tooltip="Price source for VWAP calculation. HLC3 (typical price) is standard.")
+
+// Session Settings
+sessionStart = input.session("0930-1600", "Market Session (ET)",
+     group=VWAP_GROUP,
+     tooltip="Regular trading hours in Eastern Time.")
+sessionTimezone = input.string("America/New_York", "Timezone",
+     options=["America/New_York", "America/Chicago", "America/Denver", "America/Los_Angeles"],
+     group=VWAP_GROUP,
+     tooltip="Timezone for session calculations.")
+
+// Trend Detection Settings
+trendCandleCount = input.int(6, "Early Session Candle Count", minval=3, maxval=15,
+     group=TREND_GROUP,
+     tooltip="Number of candles from session start to evaluate for trend establishment.\n" +
+             "5-6 candles is recommended for 5-minute charts.")
+trendSlopeLen = input.int(5, "VWAP Slope Period", minval=2, maxval=20,
+     group=TREND_GROUP,
+     tooltip="Number of bars to calculate VWAP slope direction.")
+minTrendStrength = input.float(60.0, "Min Trend Score (%)", minval=30, maxval=100, step=5,
+     group=TREND_GROUP,
+     tooltip="Minimum trend strength score required to consider trend valid.")
+useDailyTrendFilter = input.bool(true, "Use Daily Trend Filter",
+     group=TREND_GROUP,
+     tooltip="Require price to align with daily SMA 200 for trend confirmation.")
+dailySmaLen = input.int(200, "Daily SMA Length", minval=10, maxval=500,
+     group=TREND_GROUP)
+
+// Pullback Settings
+pullbackZoneMult = input.float(0.5, "Pullback Zone (% of band)", minval=0.1, maxval=1.0, step=0.1,
+     group=PULLBACK_GROUP,
+     tooltip="How close price must be to VWAP for pullback detection.\n" +
+             "0.5 = within 50% of the first band distance.")
+minPullbackBars = input.int(2, "Min Pullback Bars", minval=1, maxval=10,
+     group=PULLBACK_GROUP,
+     tooltip="Minimum number of bars moving toward VWAP to qualify as pullback.")
+maxPullbackBars = input.int(10, "Max Pullback Bars", minval=3, maxval=30,
+     group=PULLBACK_GROUP,
+     tooltip="Maximum bars for a pullback before it's considered trend exhaustion.")
+
+// Candlestick Pattern Settings
+usePatternFilter = input.bool(true, "Require Candlestick Pattern",
+     group=PATTERN_GROUP,
+     tooltip="Require a reversal candlestick pattern for entry confirmation.")
+hammerBodyRatio = input.float(0.3, "Hammer Body Ratio", minval=0.1, maxval=0.5, step=0.05,
+     group=PATTERN_GROUP,
+     tooltip="Maximum body size as ratio of total range for hammer/shooting star.")
+hammerWickRatio = input.float(2.0, "Hammer Wick Ratio", minval=1.5, maxval=4.0, step=0.1,
+     group=PATTERN_GROUP,
+     tooltip="Minimum ratio of long wick to body for hammer patterns.")
+engulfingMinSize = input.float(0.5, "Engulfing Min Size (ATR)", minval=0.2, maxval=2.0, step=0.1,
+     group=PATTERN_GROUP,
+     tooltip="Minimum engulfing candle size as multiple of ATR.")
+
+// Support/Resistance Settings
+useSRConfluence = input.bool(true, "Use S/R Confluence",
+     group=SR_GROUP,
+     tooltip="Look for VWAP coinciding with previous day's support/resistance.")
+srLookback = input.int(1, "Previous Days Lookback", minval=1, maxval=5,
+     group=SR_GROUP,
+     tooltip="Number of previous days to scan for S/R levels.")
+srProximityPct = input.float(0.3, "S/R Proximity (%)", minval=0.1, maxval=1.0, step=0.1,
+     group=SR_GROUP,
+     tooltip="How close VWAP must be to S/R level as percentage of price.")
+
+// Trade Management
+riskRewardRatio = input.float(2.0, "Risk/Reward Ratio", minval=1.0, maxval=5.0, step=0.5,
+     group=TRADE_GROUP,
+     tooltip="Target profit as multiple of stop loss distance.\n" +
+             "2.0 = 2:1 risk/reward (recommended).")
+atrMultiplierSL = input.float(1.0, "Stop Loss ATR Multiplier", minval=0.5, maxval=3.0, step=0.1,
+     group=TRADE_GROUP,
+     tooltip="ATR multiplier for stop loss placement. Added to swing high/low.")
+useSwingStop = input.bool(true, "Use Swing High/Low for Stop",
+     group=TRADE_GROUP,
+     tooltip="Place stop loss at recent swing high (shorts) or swing low (longs).")
+swingLookback = input.int(5, "Swing Lookback Bars", minval=2, maxval=20,
+     group=TRADE_GROUP,
+     tooltip="Bars to look back for swing high/low identification.")
+maxSignalsPerDay = input.int(3, "Max Signals Per Day", minval=1, maxval=10,
+     group=TRADE_GROUP,
+     tooltip="Maximum number of pullback signals to generate per day.")
+
+// Display Settings
+showDashboard = input.bool(true, "Show Dashboard", group=VIS_GROUP)
+showVwapBands = input.bool(true, "Show VWAP Bands", group=VIS_GROUP)
+showPullbackZone = input.bool(true, "Show Pullback Zone", group=VIS_GROUP)
+showSignalLabels = input.bool(true, "Show Signal Labels", group=VIS_GROUP)
+showSRLevels = input.bool(true, "Show S/R Levels", group=VIS_GROUP)
+showBgTint = input.bool(true, "Show Background Tint", group=VIS_GROUP)
+vwapColor = input.color(color.new(#673ab7, 0), "VWAP Color", group=VIS_GROUP)
+band1Color = input.color(color.new(#2196f3, 50), "Band 1 Color", group=VIS_GROUP)
+band2Color = input.color(color.new(#ff9800, 50), "Band 2 Color", group=VIS_GROUP)
+
+// ---------------------------------------------------------------------------
+// SESSION & TIME CALCULATIONS
+// ---------------------------------------------------------------------------
+
+// Detect if we are in the market session
+inSession = not na(time(timeframe.period, sessionStart, sessionTimezone))
+
+// Track session start
+var int sessionStartTime = na
+var int barsFromSessionStart = 0
+var bool isNewSession = false
+
+// Detect new session
+newSession = inSession and not inSession[1]
+if newSession
+    sessionStartTime := time
+    barsFromSessionStart := 0
+    isNewSession := true
+else
+    isNewSession := false
+    if inSession
+        barsFromSessionStart += 1
+
+// Session end detection
+isSessionEnd = not inSession and inSession[1]
+
+// ---------------------------------------------------------------------------
+// VWAP CALCULATION WITH BANDS
+// ---------------------------------------------------------------------------
+
+// Custom VWAP with standard deviation bands
+var float sumPV = 0.0
+var float sumV = 0.0
+var float sumPV2 = 0.0
+
+// Reset at session start
+if newSession
+    sumPV := 0.0
+    sumV := 0.0
+    sumPV2 := 0.0
+
+// Accumulate values
+if inSession
+    sumPV += vwapSource * volume
+    sumV += volume
+    sumPV2 += vwapSource * vwapSource * volume
+
+// Calculate VWAP and standard deviation
+float vwapVal = sumV > 0 ? sumPV / sumV : na
+float variance = sumV > 0 ? (sumPV2 / sumV) - (vwapVal * vwapVal) : na
+float stdev = variance > 0 ? math.sqrt(variance) : 0
+
+// Calculate bands
+float vwapUpper1 = not na(vwapVal) ? vwapVal + (stdev * vwapBand1Mult) : na
+float vwapLower1 = not na(vwapVal) ? vwapVal - (stdev * vwapBand1Mult) : na
+float vwapUpper2 = not na(vwapVal) ? vwapVal + (stdev * vwapBand2Mult) : na
+float vwapLower2 = not na(vwapVal) ? vwapVal - (stdev * vwapBand2Mult) : na
+
+// VWAP slope calculation
+float vwapSlope = not na(vwapVal) and not na(vwapVal[trendSlopeLen]) ?
+     (vwapVal - vwapVal[trendSlopeLen]) / trendSlopeLen : 0
+bool vwapSlopeUp = vwapSlope > 0
+bool vwapSlopeDown = vwapSlope < 0
+
+// ---------------------------------------------------------------------------
+// TECHNICAL INDICATORS
+// ---------------------------------------------------------------------------
+
+// ATR for volatility-adjusted calculations
+atrVal = ta.atr(14)
+
+// RSI for additional context
+rsiVal = ta.rsi(close, 14)
+
+// Volume analysis
+avgVol20 = ta.sma(volume, 20)
+relativeVol = avgVol20 > 0 ? volume / avgVol20 : 0
+
+// Daily trend data
+dailySma = request.security(syminfo.tickerid, "D", ta.sma(close, dailySmaLen),
+     lookahead=barmerge.lookahead_on)
+dailyClose = request.security(syminfo.tickerid, "D", close,
+     lookahead=barmerge.lookahead_on)
+bool dailyBullish = not na(dailySma) and dailyClose > dailySma
+bool dailyBearish = not na(dailySma) and dailyClose < dailySma
+
+// Previous day high/low for S/R
+prevDayHigh = request.security(syminfo.tickerid, "D", high[1],
+     lookahead=barmerge.lookahead_on)
+prevDayLow = request.security(syminfo.tickerid, "D", low[1],
+     lookahead=barmerge.lookahead_on)
+prevDayClose = request.security(syminfo.tickerid, "D", close[1],
+     lookahead=barmerge.lookahead_on)
+
+// Swing high/low for stop loss placement
+swingHigh = ta.highest(high, swingLookback)
+swingLow = ta.lowest(low, swingLookback)
+
+// ---------------------------------------------------------------------------
+// TREND IDENTIFICATION
+// ---------------------------------------------------------------------------
+
+// Track price position relative to VWAP at session start
+var bool priceAboveVwapAtStart = false
+var bool priceBelowVwapAtStart = false
+var bool earlyReverseAboveVwap = false
+var bool earlyReverseBelowVwap = false
+var int barsAboveVwap = 0
+var int barsBelowVwap = 0
+
+// Reset tracking at new session
+if newSession
+    priceAboveVwapAtStart := false
+    priceBelowVwapAtStart := false
+    earlyReverseAboveVwap := false
+    earlyReverseBelowVwap := false
+    barsAboveVwap := 0
+    barsBelowVwap := 0
+
+// Track early session behavior
+if inSession and not na(vwapVal)
+    // First bar of session
+    if barsFromSessionStart == 1
+        priceAboveVwapAtStart := close > vwapVal
+        priceBelowVwapAtStart := close < vwapVal
+
+    // Count bars above/below VWAP
+    if close > vwapVal
+        barsAboveVwap += 1
+    else if close < vwapVal
+        barsBelowVwap += 1
+
+    // Early reversal detection (within first 5-6 candles)
+    if barsFromSessionStart <= trendCandleCount
+        if priceBelowVwapAtStart and close > vwapVal
+            earlyReverseAboveVwap := true
+        if priceAboveVwapAtStart and close < vwapVal
+            earlyReverseBelowVwap := true
+
+// Trend Scoring (0-100)
+float trendScore = 0.0
+float maxTrendScore = 0.0
+var int trendDirection = 0  // 1 = uptrend, -1 = downtrend, 0 = no trend
+
+// Calculate trend score based on user's criteria
+if inSession and not na(vwapVal) and barsFromSessionStart > trendCandleCount
+    // --- Uptrend Scenario 1: Price above VWAP from start ---
+    maxTrendScore += 30.0
+    if priceAboveVwapAtStart and (float(barsAboveVwap) / float(barsFromSessionStart) >= 0.7)
+        trendScore += 30.0
+    else if float(barsAboveVwap) / float(barsFromSessionStart) >= 0.5
+        trendScore += 15.0
+
+    // --- Uptrend Scenario 2: Early reversal above VWAP ---
+    maxTrendScore += 25.0
+    if earlyReverseAboveVwap and close > vwapVal
+        trendScore += 25.0
+    else if earlyReverseAboveVwap
+        trendScore += 10.0
+
+    // --- VWAP Slope ---
+    maxTrendScore += 20.0
+    if vwapSlopeUp
+        trendScore += 20.0
+    else if vwapSlope > -0.01 // Slightly negative but stable
+        trendScore += 5.0
+
+    // --- Current price position ---
+    maxTrendScore += 15.0
+    if close > vwapVal
+        trendScore += 15.0
+    else if close > vwapLower1
+        trendScore += 5.0
+
+    // --- Daily trend alignment ---
+    maxTrendScore += 10.0
+    if useDailyTrendFilter and dailyBullish
+        trendScore += 10.0
+    else if not useDailyTrendFilter
+        trendScore += 10.0
+
+// Normalize trend score
+float uptrendScore = maxTrendScore > 0 ? (trendScore / maxTrendScore) * 100 : 0
+
+// Calculate downtrend score separately
+float downtrendScore = 0.0
+float maxDowntrendScore = 0.0
+
+if inSession and not na(vwapVal) and barsFromSessionStart > trendCandleCount
+    // --- Downtrend Scenario: Big green open, then reversal below VWAP ---
+    maxDowntrendScore += 30.0
+    if earlyReverseBelowVwap and close < vwapVal
+        downtrendScore += 30.0
+    else if priceBelowVwapAtStart and (float(barsBelowVwap) / float(barsFromSessionStart) >= 0.7)
+        downtrendScore += 25.0
+
+    // --- VWAP Slope downward ---
+    maxDowntrendScore += 25.0
+    if vwapSlopeDown
+        downtrendScore += 25.0
+    else if vwapSlope < 0.01
+        downtrendScore += 10.0
+
+    // --- Current price position ---
+    maxDowntrendScore += 20.0
+    if close < vwapVal
+        downtrendScore += 20.0
+    else if close < vwapUpper1
+        downtrendScore += 5.0
+
+    // --- Price staying below VWAP ---
+    maxDowntrendScore += 15.0
+    if float(barsBelowVwap) / float(barsFromSessionStart) >= 0.6
+        downtrendScore += 15.0
+
+    // --- Daily trend alignment ---
+    maxDowntrendScore += 10.0
+    if useDailyTrendFilter and dailyBearish
+        downtrendScore += 10.0
+    else if not useDailyTrendFilter
+        downtrendScore += 10.0
+
+// Normalize downtrend score
+float downtrendPctScore = maxDowntrendScore > 0 ? (downtrendScore / maxDowntrendScore) * 100 : 0
+
+// Determine trend direction
+if uptrendScore >= minTrendStrength and uptrendScore > downtrendPctScore
+    trendDirection := 1
+else if downtrendPctScore >= minTrendStrength and downtrendPctScore > uptrendScore
+    trendDirection := -1
+else
+    trendDirection := 0
+
+// ---------------------------------------------------------------------------
+// PULLBACK DETECTION
+// ---------------------------------------------------------------------------
+
+// Distance from VWAP
+float distFromVwap = not na(vwapVal) ? math.abs(close - vwapVal) : na
+float band1Dist = not na(stdev) ? stdev * vwapBand1Mult : na
+float pullbackThreshold = not na(band1Dist) ? band1Dist * pullbackZoneMult : na
+
+// Track pullback bars
+var int pullbackBars = 0
+var float pullbackStartPrice = na
+var bool inPullback = false
+
+// Pullback detection logic
+if inSession and not na(vwapVal)
+    // In uptrend, pullback is when price moves toward VWAP from above
+    if trendDirection == 1
+        if close > vwapVal and close < close[1] and close[1] > vwapVal
+            // Price moving down toward VWAP
+            if not inPullback
+                inPullback := true
+                pullbackBars := 1
+                pullbackStartPrice := close[1]
+            else
+                pullbackBars += 1
+        else if close <= vwapVal or (inPullback and close > pullbackStartPrice)
+            // Pullback ended - either touched VWAP or reversed back up
+            inPullback := false
+            pullbackBars := 0
+
+    // In downtrend, pullback is when price moves toward VWAP from below
+    else if trendDirection == -1
+        if close < vwapVal and close > close[1] and close[1] < vwapVal
+            // Price moving up toward VWAP
+            if not inPullback
+                inPullback := true
+                pullbackBars := 1
+                pullbackStartPrice := close[1]
+            else
+                pullbackBars += 1
+        else if close >= vwapVal or (inPullback and close < pullbackStartPrice)
+            // Pullback ended - either touched VWAP or reversed back down
+            inPullback := false
+            pullbackBars := 0
+    else
+        inPullback := false
+        pullbackBars := 0
+
+// Check if price is in pullback zone (near VWAP)
+bool inPullbackZone = not na(distFromVwap) and not na(pullbackThreshold) and
+     distFromVwap <= pullbackThreshold
+
+// Valid pullback criteria
+bool validPullback = inPullbackZone and pullbackBars >= minPullbackBars and
+     pullbackBars <= maxPullbackBars
+
+// ---------------------------------------------------------------------------
+// CANDLESTICK PATTERN DETECTION
+// ---------------------------------------------------------------------------
+
+// Candle components
+float bodySize = math.abs(close - open)
+float upperWick = high - math.max(close, open)
+float lowerWick = math.min(close, open) - low
+float totalRange = high - low
+bool isBullishCandle = close > open
+bool isBearishCandle = close < open
+
+// --- Bullish Hammer (for buy signals at VWAP in uptrend) ---
+bool isHammer = totalRange > 0 and
+     (bodySize / totalRange) <= hammerBodyRatio and
+     lowerWick >= (bodySize * hammerWickRatio) and
+     upperWick < lowerWick * 0.5
+
+// --- Bullish Engulfing ---
+bool isBullishEngulfing = isBullishCandle and
+     close[1] < open[1] and  // Previous candle was bearish
+     close > open[1] and      // Current close above previous open
+     open < close[1] and      // Current open below previous close
+     bodySize >= atrVal * engulfingMinSize
+
+// --- Dragonfly Doji (bullish) ---
+bool isDragonflyDoji = totalRange > 0 and
+     (bodySize / totalRange) <= 0.1 and
+     lowerWick >= totalRange * 0.7 and
+     upperWick <= totalRange * 0.1
+
+// --- Bearish Shooting Star (for sell signals at VWAP in downtrend) ---
+bool isShootingStar = totalRange > 0 and
+     (bodySize / totalRange) <= hammerBodyRatio and
+     upperWick >= (bodySize * hammerWickRatio) and
+     lowerWick < upperWick * 0.5
+
+// --- Bearish Engulfing ---
+bool isBearishEngulfing = isBearishCandle and
+     close[1] > open[1] and  // Previous candle was bullish
+     close < open[1] and      // Current close below previous open
+     open > close[1] and      // Current open above previous close
+     bodySize >= atrVal * engulfingMinSize
+
+// --- Gravestone Doji (bearish) ---
+bool isGravestoneDoji = totalRange > 0 and
+     (bodySize / totalRange) <= 0.1 and
+     upperWick >= totalRange * 0.7 and
+     lowerWick <= totalRange * 0.1
+
+// Combined pattern signals
+bool bullishPattern = isHammer or isBullishEngulfing or isDragonflyDoji
+bool bearishPattern = isShootingStar or isBearishEngulfing or isGravestoneDoji
+
+// Pattern filter check
+bool patternConfirmedLong = not usePatternFilter or bullishPattern
+bool patternConfirmedShort = not usePatternFilter or bearishPattern
+
+// ---------------------------------------------------------------------------
+// SUPPORT/RESISTANCE CONFLUENCE
+// ---------------------------------------------------------------------------
+
+// Check if VWAP coincides with previous day's S/R levels
+bool vwapAtPrevDayHigh = not na(prevDayHigh) and not na(vwapVal) and
+     math.abs(vwapVal - prevDayHigh) / prevDayHigh * 100 <= srProximityPct
+bool vwapAtPrevDayLow = not na(prevDayLow) and not na(vwapVal) and
+     math.abs(vwapVal - prevDayLow) / prevDayLow * 100 <= srProximityPct
+bool vwapAtPrevDayClose = not na(prevDayClose) and not na(vwapVal) and
+     math.abs(vwapVal - prevDayClose) / prevDayClose * 100 <= srProximityPct
+
+// S/R confluence score
+float srConfluenceScore = 0.0
+if vwapAtPrevDayHigh
+    srConfluenceScore += 30.0
+if vwapAtPrevDayLow
+    srConfluenceScore += 30.0
+if vwapAtPrevDayClose
+    srConfluenceScore += 20.0
+
+bool hasSRConfluence = not useSRConfluence or srConfluenceScore > 0
+
+// ---------------------------------------------------------------------------
+// SIGNAL GENERATION
+// ---------------------------------------------------------------------------
+
+var int todaySignalCount = 0
+
+// Reset signal count on new session
+if newSession
+    todaySignalCount := 0
+
+// Check signal limit
+bool canSignal = todaySignalCount < maxSignalsPerDay
+
+// --- Buy Signal (Long Entry) ---
+// Uptrend + pullback to VWAP + bullish pattern + S/R confluence
+bool buyCondition = inSession and
+     trendDirection == 1 and
+     inPullbackZone and
+     patternConfirmedLong and
+     hasSRConfluence and
+     canSignal and
+     (not useDailyTrendFilter or dailyBullish)
+
+// --- Sell Signal (Short Entry) ---
+// Downtrend + pullback to VWAP + bearish pattern + S/R confluence
+bool sellCondition = inSession and
+     trendDirection == -1 and
+     inPullbackZone and
+     patternConfirmedShort and
+     hasSRConfluence and
+     canSignal and
+     (not useDailyTrendFilter or dailyBearish)
+
+// Track confirmed signals
+bool buySignal = buyCondition and barstate.isconfirmed
+bool sellSignal = sellCondition and barstate.isconfirmed
+
+// Update signal count
+if buySignal or sellSignal
+    todaySignalCount += 1
+
+// ---------------------------------------------------------------------------
+// STOP LOSS AND TAKE PROFIT CALCULATION
+// ---------------------------------------------------------------------------
+
+// Calculate stop loss levels
+float longStopLoss = na
+float shortStopLoss = na
+float longTakeProfit = na
+float shortTakeProfit = na
+float longRiskDist = na
+float shortRiskDist = na
+
+if buySignal
+    if useSwingStop
+        longStopLoss := swingLow - (atrVal * atrMultiplierSL)
+    else
+        longStopLoss := close - (atrVal * 1.5)
+    longRiskDist := close - longStopLoss
+    longTakeProfit := close + (longRiskDist * riskRewardRatio)
+
+if sellSignal
+    if useSwingStop
+        shortStopLoss := swingHigh + (atrVal * atrMultiplierSL)
+    else
+        shortStopLoss := close + (atrVal * 1.5)
+    shortRiskDist := shortStopLoss - close
+    shortTakeProfit := close - (shortRiskDist * riskRewardRatio)
+
+// Store levels for display
+var float activeLongStop = na
+var float activeLongTarget = na
+var float activeShortStop = na
+var float activeShortTarget = na
+var float activeEntryPrice = na
+var int activeTradeDir = 0  // 1 = long, -1 = short, 0 = none
+
+if buySignal
+    activeLongStop := longStopLoss
+    activeLongTarget := longTakeProfit
+    activeEntryPrice := close
+    activeTradeDir := 1
+    activeShortStop := na
+    activeShortTarget := na
+
+if sellSignal
+    activeShortStop := shortStopLoss
+    activeShortTarget := shortTakeProfit
+    activeEntryPrice := close
+    activeTradeDir := -1
+    activeLongStop := na
+    activeLongTarget := na
+
+// Reset on session end
+if isSessionEnd
+    activeLongStop := na
+    activeLongTarget := na
+    activeShortStop := na
+    activeShortTarget := na
+    activeEntryPrice := na
+    activeTradeDir := 0
+
+// ---------------------------------------------------------------------------
+// SIGNAL QUALITY SCORING
+// ---------------------------------------------------------------------------
+
+float signalScore = 0.0
+float maxSignalScore = 0.0
+
+// --- Factor 1: Trend Strength (0-25 points) ---
+maxSignalScore += 25.0
+float currentTrendScore = trendDirection == 1 ? uptrendScore : downtrendPctScore
+if currentTrendScore >= 80
+    signalScore += 25.0
+else if currentTrendScore >= 70
+    signalScore += 20.0
+else if currentTrendScore >= 60
+    signalScore += 15.0
+
+// --- Factor 2: Pattern Quality (0-25 points) ---
+maxSignalScore += 25.0
+if (trendDirection == 1 and (isBullishEngulfing or isHammer)) or
+   (trendDirection == -1 and (isBearishEngulfing or isShootingStar))
+    signalScore += 25.0
+else if (trendDirection == 1 and isDragonflyDoji) or
+        (trendDirection == -1 and isGravestoneDoji)
+    signalScore += 15.0
+
+// --- Factor 3: S/R Confluence (0-20 points) ---
+maxSignalScore += 20.0
+signalScore += math.min(srConfluenceScore * 0.67, 20.0)
+
+// --- Factor 4: Volume (0-15 points) ---
+maxSignalScore += 15.0
+if relativeVol >= 1.5
+    signalScore += 15.0
+else if relativeVol >= 1.2
+    signalScore += 10.0
+else if relativeVol >= 1.0
+    signalScore += 5.0
+
+// --- Factor 5: VWAP Proximity (0-15 points) ---
+maxSignalScore += 15.0
+if not na(distFromVwap) and not na(pullbackThreshold)
+    float proximityRatio = 1 - (distFromVwap / pullbackThreshold)
+    signalScore += math.max(0, proximityRatio * 15.0)
+
+// Normalize score
+float signalPctScore = maxSignalScore > 0 ? (signalScore / maxSignalScore) * 100 : 0
+
+// Quality classification
+string signalQuality = signalPctScore >= 80 ? "STRONG" :
+                        signalPctScore >= 60 ? "GOOD" :
+                        signalPctScore >= 40 ? "MODERATE" : "WEAK"
+
+// ---------------------------------------------------------------------------
+// CHART VISUALS -- VWAP AND BANDS
+// ---------------------------------------------------------------------------
+
+// Plot VWAP
+plot(inSession ? vwapVal : na, "VWAP", color=vwapColor, linewidth=2)
+
+// Plot bands if enabled
+p_upper1 = plot(inSession and showVwapBands ? vwapUpper1 : na, "Upper Band 1",
+     color=band1Color, linewidth=1)
+p_lower1 = plot(inSession and showVwapBands ? vwapLower1 : na, "Lower Band 1",
+     color=band1Color, linewidth=1)
+p_upper2 = plot(inSession and showVwapBands ? vwapUpper2 : na, "Upper Band 2",
+     color=band2Color, linewidth=1, style=plot.style_linebr)
+p_lower2 = plot(inSession and showVwapBands ? vwapLower2 : na, "Lower Band 2",
+     color=band2Color, linewidth=1, style=plot.style_linebr)
+
+// Fill between bands
+fill(p_upper1, p_lower1, color=color.new(vwapColor, 95), title="VWAP Zone Fill")
+
+// Plot pullback zone if enabled
+p_vwap = plot(inSession and showPullbackZone ? vwapVal : na, "VWAP (for fill)",
+     color=color.new(vwapColor, 100), display=display.none)
+float pullbackZoneUpper = not na(vwapVal) and not na(pullbackThreshold) ?
+     vwapVal + pullbackThreshold : na
+float pullbackZoneLower = not na(vwapVal) and not na(pullbackThreshold) ?
+     vwapVal - pullbackThreshold : na
+p_pbUpper = plot(inSession and showPullbackZone ? pullbackZoneUpper : na,
+     "Pullback Zone Upper", color=color.new(color.yellow, 80), display=display.none)
+p_pbLower = plot(inSession and showPullbackZone ? pullbackZoneLower : na,
+     "Pullback Zone Lower", color=color.new(color.yellow, 80), display=display.none)
+fill(p_pbUpper, p_pbLower, color=color.new(color.yellow, 92), title="Pullback Zone")
+
+// ---------------------------------------------------------------------------
+// CHART VISUALS -- S/R LEVELS
+// ---------------------------------------------------------------------------
+
+if showSRLevels and inSession
+    // Previous day high
+    if vwapAtPrevDayHigh and barstate.islast
+        line.new(bar_index - 50, prevDayHigh, bar_index, prevDayHigh,
+             color=color.new(color.green, 40), width=1, style=line.style_dashed)
+    // Previous day low
+    if vwapAtPrevDayLow and barstate.islast
+        line.new(bar_index - 50, prevDayLow, bar_index, prevDayLow,
+             color=color.new(color.red, 40), width=1, style=line.style_dashed)
+    // Previous day close
+    if vwapAtPrevDayClose and barstate.islast
+        line.new(bar_index - 50, prevDayClose, bar_index, prevDayClose,
+             color=color.new(color.gray, 40), width=1, style=line.style_dashed)
+
+// ---------------------------------------------------------------------------
+// CHART VISUALS -- SIGNAL LABELS
+// ---------------------------------------------------------------------------
+
+if showSignalLabels
+    if buySignal
+        string buyText = "BUY VWAP PULLBACK\n" +
+             signalQuality + " (" + str.tostring(signalPctScore, "#.0") + "%)\n" +
+             "Entry: " + str.tostring(close, "#.##") + "\n" +
+             "Stop: " + str.tostring(longStopLoss, "#.##") + "\n" +
+             "Target: " + str.tostring(longTakeProfit, "#.##")
+        color buyColor = signalPctScore >= 80 ? color.lime :
+                          signalPctScore >= 60 ? color.green : #4caf50
+        label.new(bar_index, low, buyText,
+             style=label.style_label_up, color=color.new(buyColor, 10),
+             textcolor=color.white, size=size.small)
+
+        // Draw stop loss and take profit lines
+        line.new(bar_index, longStopLoss, bar_index + 20, longStopLoss,
+             color=color.new(color.red, 30), width=2, style=line.style_dashed)
+        line.new(bar_index, longTakeProfit, bar_index + 20, longTakeProfit,
+             color=color.new(color.green, 30), width=2, style=line.style_dashed)
+
+    if sellSignal
+        string sellText = "SELL VWAP PULLBACK\n" +
+             signalQuality + " (" + str.tostring(signalPctScore, "#.0") + "%)\n" +
+             "Entry: " + str.tostring(close, "#.##") + "\n" +
+             "Stop: " + str.tostring(shortStopLoss, "#.##") + "\n" +
+             "Target: " + str.tostring(shortTakeProfit, "#.##")
+        color sellColor = signalPctScore >= 80 ? #ff1744 :
+                          signalPctScore >= 60 ? #ff4444 : #ff8888
+        label.new(bar_index, high, sellText,
+             style=label.style_label_down, color=color.new(sellColor, 10),
+             textcolor=color.white, size=size.small)
+
+        // Draw stop loss and take profit lines
+        line.new(bar_index, shortStopLoss, bar_index + 20, shortStopLoss,
+             color=color.new(color.red, 30), width=2, style=line.style_dashed)
+        line.new(bar_index, shortTakeProfit, bar_index + 20, shortTakeProfit,
+             color=color.new(color.green, 30), width=2, style=line.style_dashed)
+
+// ---------------------------------------------------------------------------
+// CHART VISUALS -- BACKGROUND TINT
+// ---------------------------------------------------------------------------
+
+// Tint when in pullback zone
+color pullbackBg = inPullbackZone and trendDirection != 0 and showBgTint ?
+     color.new(color.yellow, 95) : na
+bgcolor(pullbackBg, title="Pullback Zone Background")
+
+// Tint on signals
+color buyBg = buySignal and showBgTint ? color.new(color.green, 90) : na
+color sellBg = sellSignal and showBgTint ? color.new(color.red, 90) : na
+bgcolor(buyBg, title="Buy Signal Background")
+bgcolor(sellBg, title="Sell Signal Background")
+
+// ---------------------------------------------------------------------------
+// PATTERN INDICATORS (PLOT SHAPES)
+// ---------------------------------------------------------------------------
+
+// Show pattern markers when patterns are detected
+plotshape(isHammer and inSession, title="Hammer", location=location.belowbar,
+     color=color.new(color.green, 20), style=shape.triangleup, size=size.tiny)
+plotshape(isBullishEngulfing and inSession, title="Bullish Engulfing", location=location.belowbar,
+     color=color.new(color.lime, 20), style=shape.arrowup, size=size.tiny)
+plotshape(isShootingStar and inSession, title="Shooting Star", location=location.abovebar,
+     color=color.new(color.red, 20), style=shape.triangledown, size=size.tiny)
+plotshape(isBearishEngulfing and inSession, title="Bearish Engulfing", location=location.abovebar,
+     color=color.new(color.orange, 20), style=shape.arrowdown, size=size.tiny)
+
+// ---------------------------------------------------------------------------
+// ALERTS
+// ---------------------------------------------------------------------------
+
+alertcondition(buySignal, title="VWAP Pullback Buy Signal",
+     message="VWAP PULLBACK: BUY signal on {{ticker}} | " +
+             "Quality: " + signalQuality + " (" + str.tostring(signalPctScore, "#.0") + "%) | " +
+             "Entry: {{close}} | Trend Score: " + str.tostring(uptrendScore, "#.0"))
+
+alertcondition(sellSignal, title="VWAP Pullback Sell Signal",
+     message="VWAP PULLBACK: SELL signal on {{ticker}} | " +
+             "Quality: " + signalQuality + " (" + str.tostring(signalPctScore, "#.0") + "%) | " +
+             "Entry: {{close}} | Trend Score: " + str.tostring(downtrendPctScore, "#.0"))
+
+alertcondition(buySignal and signalPctScore >= 80, title="Strong VWAP Buy",
+     message="VWAP PULLBACK: STRONG BUY on {{ticker}} | Score: " +
+             str.tostring(signalPctScore, "#.0"))
+
+alertcondition(sellSignal and signalPctScore >= 80, title="Strong VWAP Sell",
+     message="VWAP PULLBACK: STRONG SELL on {{ticker}} | Score: " +
+             str.tostring(signalPctScore, "#.0"))
+
+alertcondition(inPullbackZone and trendDirection != 0, title="Pullback Zone Entry",
+     message="VWAP: Price entering pullback zone on {{ticker}} | " +
+             "Trend: " + (trendDirection == 1 ? "UPTREND" : "DOWNTREND"))
+
+// ---------------------------------------------------------------------------
+// DASHBOARD TABLE
+// ---------------------------------------------------------------------------
+
+if showDashboard and barstate.islast
+    var table dash = table.new(position.top_right, 2, 28,
+         bgcolor=color.new(color.black, 15), border_width=1, border_color=color.gray,
+         frame_width=1, frame_color=color.gray)
+
+    headerBg = color.new(#1a1a2e, 0)
+    sepBg    = color.new(#2a2a4a, 0)
+    textCol  = color.white
+
+    // ---- Row 0: Title ----
+    table.cell(dash, 0, 0, "VWAP Pullback", text_color=textCol, bgcolor=headerBg,
+         text_size=size.small, text_halign=text.align_center)
+    table.merge_cells(dash, 0, 0, 1, 0)
+
+    // ---- Row 1: Trend Section ----
+    table.cell(dash, 0, 1, "--- Trend Analysis ---", text_color=color.yellow, bgcolor=sepBg,
+         text_size=size.tiny, text_halign=text.align_center)
+    table.merge_cells(dash, 0, 1, 1, 1)
+
+    // Row 2: Trend Direction
+    string trendStr = trendDirection == 1 ? "UPTREND" :
+                      trendDirection == -1 ? "DOWNTREND" : "NO TREND"
+    color trendColor = trendDirection == 1 ? color.green :
+                       trendDirection == -1 ? color.red : color.gray
+    table.cell(dash, 0, 2, "Trend", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(dash, 1, 2, trendStr, text_color=trendColor, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 3: Trend Score
+    float displayTrendScore = trendDirection == 1 ? uptrendScore :
+                              trendDirection == -1 ? downtrendPctScore : 0
+    color trendScoreColor = displayTrendScore >= 80 ? color.lime :
+                            displayTrendScore >= 60 ? color.green : color.yellow
+    table.cell(dash, 0, 3, "Trend Score", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(dash, 1, 3, trendDirection != 0 ?
+         str.tostring(displayTrendScore, "#.0") + "%" : "---",
+         text_color=trendScoreColor, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 4: VWAP Slope
+    string slopeStr = vwapSlopeUp ? "UP" : vwapSlopeDown ? "DOWN" : "FLAT"
+    color slopeColor = vwapSlopeUp ? color.green : vwapSlopeDown ? color.red : color.gray
+    table.cell(dash, 0, 4, "VWAP Slope", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(dash, 1, 4, slopeStr, text_color=slopeColor, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 5: Daily Trend
+    string dailyStr = dailyBullish ? "BULLISH" : dailyBearish ? "BEARISH" : "NEUTRAL"
+    color dailyColor = dailyBullish ? color.green : dailyBearish ? color.red : color.gray
+    table.cell(dash, 0, 5, "Daily Trend", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(dash, 1, 5, useDailyTrendFilter ? dailyStr : "OFF",
+         text_color=useDailyTrendFilter ? dailyColor : color.gray, bgcolor=headerBg, text_size=size.tiny)
+
+    // ---- Row 6: VWAP Section ----
+    table.cell(dash, 0, 6, "--- VWAP Levels ---", text_color=color.yellow, bgcolor=sepBg,
+         text_size=size.tiny, text_halign=text.align_center)
+    table.merge_cells(dash, 0, 6, 1, 6)
+
+    // Row 7: VWAP Value
+    table.cell(dash, 0, 7, "VWAP", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(dash, 1, 7, not na(vwapVal) ? str.tostring(vwapVal, "#.##") : "---",
+         text_color=vwapColor, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 8: Upper Band 1
+    table.cell(dash, 0, 8, "Upper Band (2σ)", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(dash, 1, 8, not na(vwapUpper1) ? str.tostring(vwapUpper1, "#.##") : "---",
+         text_color=band1Color, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 9: Lower Band 1
+    table.cell(dash, 0, 9, "Lower Band (2σ)", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(dash, 1, 9, not na(vwapLower1) ? str.tostring(vwapLower1, "#.##") : "---",
+         text_color=band1Color, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 10: Price vs VWAP
+    string priceVsVwap = not na(vwapVal) ?
+         (close > vwapVal ? "ABOVE" : close < vwapVal ? "BELOW" : "AT VWAP") : "---"
+    color priceVsVwapColor = close > vwapVal ? color.green : close < vwapVal ? color.red : color.gray
+    table.cell(dash, 0, 10, "Price vs VWAP", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(dash, 1, 10, priceVsVwap, text_color=priceVsVwapColor, bgcolor=headerBg, text_size=size.tiny)
+
+    // ---- Row 11: Pullback Section ----
+    table.cell(dash, 0, 11, "--- Pullback Status ---", text_color=color.yellow, bgcolor=sepBg,
+         text_size=size.tiny, text_halign=text.align_center)
+    table.merge_cells(dash, 0, 11, 1, 11)
+
+    // Row 12: In Pullback Zone
+    string pbZoneStr = inPullbackZone ? "YES" : "NO"
+    color pbZoneColor = inPullbackZone ? color.green : color.gray
+    table.cell(dash, 0, 12, "In Pullback Zone", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(dash, 1, 12, pbZoneStr, text_color=pbZoneColor, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 13: Distance from VWAP
+    table.cell(dash, 0, 13, "Dist from VWAP", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(dash, 1, 13, not na(distFromVwap) ? str.tostring(distFromVwap, "#.##") : "---",
+         text_color=color.gray, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 14: Pullback Bars
+    table.cell(dash, 0, 14, "Pullback Bars", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(dash, 1, 14, inPullback ? str.tostring(pullbackBars) : "---",
+         text_color=inPullback ? color.yellow : color.gray, bgcolor=headerBg, text_size=size.tiny)
+
+    // ---- Row 15: Pattern Section ----
+    table.cell(dash, 0, 15, "--- Patterns ---", text_color=color.yellow, bgcolor=sepBg,
+         text_size=size.tiny, text_halign=text.align_center)
+    table.merge_cells(dash, 0, 15, 1, 15)
+
+    // Row 16: Bullish Patterns
+    string bullPatternStr = isHammer ? "HAMMER" :
+                            isBullishEngulfing ? "ENGULFING" :
+                            isDragonflyDoji ? "DRAGONFLY" : "NONE"
+    color bullPatternColor = bullishPattern ? color.green : color.gray
+    table.cell(dash, 0, 16, "Bullish Pattern", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(dash, 1, 16, bullPatternStr, text_color=bullPatternColor, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 17: Bearish Patterns
+    string bearPatternStr = isShootingStar ? "SHOOTING STAR" :
+                            isBearishEngulfing ? "ENGULFING" :
+                            isGravestoneDoji ? "GRAVESTONE" : "NONE"
+    color bearPatternColor = bearishPattern ? color.red : color.gray
+    table.cell(dash, 0, 17, "Bearish Pattern", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(dash, 1, 17, bearPatternStr, text_color=bearPatternColor, bgcolor=headerBg, text_size=size.tiny)
+
+    // ---- Row 18: S/R Section ----
+    table.cell(dash, 0, 18, "--- S/R Confluence ---", text_color=color.yellow, bgcolor=sepBg,
+         text_size=size.tiny, text_halign=text.align_center)
+    table.merge_cells(dash, 0, 18, 1, 18)
+
+    // Row 19: S/R Score
+    table.cell(dash, 0, 19, "S/R Score", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(dash, 1, 19, useSRConfluence ? str.tostring(srConfluenceScore, "#.0") : "OFF",
+         text_color=srConfluenceScore > 0 ? color.green : color.gray, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 20: S/R Level Match
+    string srMatchStr = vwapAtPrevDayHigh ? "Prev High" :
+                        vwapAtPrevDayLow ? "Prev Low" :
+                        vwapAtPrevDayClose ? "Prev Close" : "None"
+    table.cell(dash, 0, 20, "S/R Match", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(dash, 1, 20, useSRConfluence ? srMatchStr : "OFF",
+         text_color=hasSRConfluence and useSRConfluence ? color.green : color.gray,
+         bgcolor=headerBg, text_size=size.tiny)
+
+    // ---- Row 21: Signal Section ----
+    table.cell(dash, 0, 21, "--- Signal Status ---", text_color=color.yellow, bgcolor=sepBg,
+         text_size=size.tiny, text_halign=text.align_center)
+    table.merge_cells(dash, 0, 21, 1, 21)
+
+    // Row 22: Active Trade
+    string activeTradeStr = activeTradeDir == 1 ? "LONG" :
+                            activeTradeDir == -1 ? "SHORT" : "NONE"
+    color activeTradeColor = activeTradeDir == 1 ? color.green :
+                             activeTradeDir == -1 ? color.red : color.gray
+    table.cell(dash, 0, 22, "Active Trade", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(dash, 1, 22, activeTradeStr, text_color=activeTradeColor, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 23: Signal Quality
+    table.cell(dash, 0, 23, "Signal Quality", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    color qualityColor = signalPctScore >= 80 ? color.lime :
+                         signalPctScore >= 60 ? color.green :
+                         signalPctScore >= 40 ? color.yellow : color.gray
+    table.cell(dash, 1, 23, activeTradeDir != 0 ?
+         str.tostring(signalPctScore, "#.0") + "% (" + signalQuality + ")" : "---",
+         text_color=qualityColor, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 24: Signals Today
+    table.cell(dash, 0, 24, "Signals Today", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(dash, 1, 24, str.tostring(todaySignalCount) + " / " + str.tostring(maxSignalsPerDay),
+         text_color=color.gray, bgcolor=headerBg, text_size=size.tiny)
+
+    // ---- Row 25: Trade Levels Section ----
+    table.cell(dash, 0, 25, "--- Trade Levels ---", text_color=color.yellow, bgcolor=sepBg,
+         text_size=size.tiny, text_halign=text.align_center)
+    table.merge_cells(dash, 0, 25, 1, 25)
+
+    // Row 26: Stop Loss
+    float displayStop = activeTradeDir == 1 ? activeLongStop :
+                        activeTradeDir == -1 ? activeShortStop : na
+    table.cell(dash, 0, 26, "Stop Loss", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(dash, 1, 26, not na(displayStop) ? str.tostring(displayStop, "#.##") : "---",
+         text_color=color.red, bgcolor=headerBg, text_size=size.tiny)
+
+    // Row 27: Take Profit
+    float displayTarget = activeTradeDir == 1 ? activeLongTarget :
+                          activeTradeDir == -1 ? activeShortTarget : na
+    table.cell(dash, 0, 27, "Take Profit (2:1)", text_color=textCol, bgcolor=headerBg, text_size=size.tiny)
+    table.cell(dash, 1, 27, not na(displayTarget) ? str.tostring(displayTarget, "#.##") : "---",
+         text_color=color.green, bgcolor=headerBg, text_size=size.tiny)
